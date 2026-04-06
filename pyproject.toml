@@ -1,0 +1,85 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sensor-app"
+version = "0.1.0"
+description = "Industrial IoT sensor ingestion and metrics service (sensor_app)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110.0",
+    "httpx>=0.27.0",
+    "numpy>=1.26.0",
+    "polars>=1.21.0",
+    "pydantic>=2.6.4",
+    "pydantic-settings>=2.2.1",
+    "slowapi>=0.1.9",
+    "uvicorn[standard]>=0.29.0",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.20.0",
+    "pytest-cov>=6.0.0",
+    "pytest>=9.0.2",
+    "ruff>=0.15.9",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "W",
+    "F",
+    "I",
+    "C",
+    "B",
+]
+ignore = [
+    "E501",
+    "B008",
+    "W191",
+]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = "polars.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "numpy.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "slowapi.*"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+pythonpath = ["src"]
+addopts = "-v --cov=sensor_app"

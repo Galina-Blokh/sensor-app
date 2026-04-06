@@ -1,0 +1,159 @@
+{
+  "version": "1.0.0",
+  "description": "Schema definition for industrial compressed air sensor data",
+  "tables": {
+    "sensor_readings": {
+      "description": "Time-series sensor data from compressor devices",
+      "columns": {
+        "timestamp": {
+          "type": "datetime",
+          "format": "ISO 8601",
+          "required": true,
+          "description": "Reading timestamp in UTC"
+        },
+        "station_id": {
+          "type": "string",
+          "required": true,
+          "description": "Unique identifier for the station"
+        },
+        "device_id": {
+          "type": "string",
+          "required": true,
+          "description": "Unique identifier for the compressor device within a station"
+        },
+        "discharge_pressure": {
+          "type": "float",
+          "unit": "bar",
+          "required": false,
+          "valid_range": {
+            "min": 0.0,
+            "max": 16.0
+          },
+          "description": "Discharge pressure in bar"
+        },
+        "air_flow_rate": {
+          "type": "float",
+          "unit": "m³/h",
+          "required": false,
+          "valid_range": {
+            "min": 0.0,
+            "max": 600.0
+          },
+          "description": "Volumetric air flow rate in cubic meters per hour"
+        },
+        "power_consumption": {
+          "type": "float",
+          "unit": "kW",
+          "required": false,
+          "valid_range": {
+            "min": 0.0,
+            "max": 350.0
+          },
+          "description": "Electrical power consumption in kilowatts"
+        },
+        "motor_speed": {
+          "type": "integer",
+          "unit": "RPM",
+          "required": false,
+          "valid_range": {
+            "min": 0,
+            "max": 4000
+          },
+          "description": "Compressor motor rotational speed"
+        },
+        "discharge_temp": {
+          "type": "float",
+          "unit": "°C",
+          "required": false,
+          "valid_range": {
+            "min": -10.0,
+            "max": 120.0
+          },
+          "description": "Discharge air temperature in Celsius"
+        }
+      }
+    },
+    "station_metadata": {
+      "description": "Static metadata for compressor stations",
+      "columns": {
+        "station_id": {
+          "type": "string",
+          "required": true,
+          "description": "Unique identifier for the station"
+        },
+        "station_name": {
+          "type": "string",
+          "required": true,
+          "description": "Human-readable station name"
+        },
+        "location": {
+          "type": "string",
+          "required": true,
+          "description": "Physical location of the station"
+        },
+        "commissioned_date": {
+          "type": "date",
+          "format": "YYYY-MM-DD",
+          "required": true,
+          "description": "Date the station was commissioned"
+        },
+        "num_compressors": {
+          "type": "integer",
+          "required": true,
+          "valid_range": {
+            "min": 1,
+            "max": 10
+          },
+          "description": "Number of compressor devices at the station"
+        }
+      }
+    }
+  },
+  "sensor_types": {
+    "discharge_pressure": {
+      "category": "mechanical",
+      "typical_operating_range": {
+        "min": 6.0,
+        "max": 13.0
+      },
+      "flatline_threshold_minutes": 30,
+      "description": "Values outside typical range are not necessarily invalid but may indicate abnormal operation"
+    },
+    "air_flow_rate": {
+      "category": "mechanical",
+      "typical_operating_range": {
+        "min": 10.0,
+        "max": 450.0
+      },
+      "flatline_threshold_minutes": 30,
+      "description": "Zero flow is valid (device off). Sustained zero flow during expected operation may indicate a sensor fault"
+    },
+    "power_consumption": {
+      "category": "electrical",
+      "typical_operating_range": {
+        "min": 5.0,
+        "max": 280.0
+      },
+      "flatline_threshold_minutes": 30,
+      "description": "Zero power is valid (device off). Non-zero power with zero flow may indicate a fault"
+    },
+    "motor_speed": {
+      "category": "mechanical",
+      "typical_operating_range": {
+        "min": 800,
+        "max": 3600
+      },
+      "flatline_threshold_minutes": 60,
+      "description": "Zero RPM is valid (device off)"
+    },
+    "discharge_temp": {
+      "category": "thermal",
+      "typical_operating_range": {
+        "min": 25.0,
+        "max": 95.0
+      },
+      "flatline_threshold_minutes": 60,
+      "description": "Ambient temperature when device is off; rises during operation"
+    }
+  }
+}

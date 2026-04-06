@@ -1,0 +1,38 @@
+# Continuous integration: format (check), lint, types, tests.
+# Requires repo files: pyproject.toml, uv.lock, src/, tests/
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+
+      - name: Python
+        run: uv python install 3.11
+
+      - name: Sync
+        run: uv sync --all-groups
+
+      - name: Ruff format (check only)
+        run: uv run ruff format --check .
+
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      - name: Mypy
+        run: uv run mypy src/sensor_app tests
+
+      - name: Pytest
+        run: uv run pytest
