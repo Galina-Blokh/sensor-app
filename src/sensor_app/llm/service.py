@@ -1,4 +1,4 @@
-"""Orchestration: prompts + LLM backend + structured query execution."""
+"""Orchestration: prompts + :class:`~sensor_app.llm.client.LLMBackend` + structured NL query execution."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from sensor_app.llm.query_execute import (
     parse_and_validate_plan,
     run_query_plan,
 )
+from sensor_app.llm.types import ChatResult
 from sensor_app.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -60,28 +61,30 @@ class LLMFeatureService:
         snap: StoredSnapshot,
         *,
         request_id: str | None,
-    ) -> str:
+    ) -> tuple[str, str]:
         ctx = snapshot_metrics_context(snap)
         user = dumps_bounded(ctx, self._settings.llm_max_context_chars)
-        return await self._one_shot(
+        res = await self._one_shot(
             system=_SYSTEM_METRICS_SUMMARY,
             user=f"Station metrics JSON:\n{user}\n\nSummarize operational health.",
             request_id=request_id,
         )
+        return res.text, res.model or self._settings.llm_model
 
     async def natural_language_dq_summary(
         self,
         snap: StoredSnapshot,
         *,
         request_id: str | None,
-    ) -> str:
+    ) -> tuple[str, str]:
         ctx = snapshot_dq_context(snap)
         user = dumps_bounded(ctx, self._settings.llm_max_context_chars)
-        return await self._one_shot(
+        res = await self._one_shot(
             system=_SYSTEM_DQ_SUMMARY,
             user=f"Data quality JSON:\n{user}\n\nSummarize data-quality issues.",
             request_id=request_id,
         )
+        return res.text, res.model or self._settings.llm_model
 
     async def natural_language_query(
         self,
@@ -89,7 +92,7 @@ class LLMFeatureService:
         snaps: list[StoredSnapshot],
         *,
         request_id: str | None,
-    ) -> tuple[str, dict[str, Any]]:
+    ) -> tuple[str, dict[str, Any], str]:
         if not snaps:
             facts: dict[str, Any] = {
                 "metric_key": "average_pressure_bar",
@@ -99,7 +102,7 @@ class LLMFeatureService:
                 "n_values": 0,
                 "snapshot_ids_used": [],
             }
-            return format_query_answer(facts), facts
+            return format_query_answer(facts), facts, self._settings.llm_model
         allowed = ", ".join(sorted(DEVICE_METRIC_KEYS))
         aggs = ", ".join(sorted(["mean", "max", "min", "sum", "latest"]))
         payload = multi_snapshot_query_context(snaps)
@@ -111,19 +114,20 @@ class LLMFeatureService:
             f"Question: {question}\n\n"
             "Return one JSON object only."
         )
-        raw = await self._one_shot(
+        res = await self._one_shot(
             system=_SYSTEM_QUERY_PLANNER,
             user=plan_prompt,
             request_id=request_id,
             max_tokens=256,
         )
         try:
-            obj = extract_json_object(raw)
+            obj = extract_json_object(res.text)
             plan = parse_and_validate_plan(obj)
         except (ValueError, KeyError, TypeError) as e:
             raise LLMError(f"invalid query plan from model: {e}") from e
         facts = run_query_plan(snaps, plan)
-        return format_query_answer(facts), facts
+        model_used = res.model or self._settings.llm_model
+        return format_query_answer(facts), facts, model_used
 
     async def _one_shot(
         self,
@@ -132,7 +136,7 @@ class LLMFeatureService:
         user: str,
         request_id: str | None,
         max_tokens: int = 512,
-    ) -> str:
+    ) -> ChatResult:
         t0 = time.perf_counter()
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         try:
@@ -163,7 +167,8 @@ class LLMFeatureService:
                 "prompt_tokens": res.prompt_tokens,
                 "completion_tokens": res.completion_tokens,
                 "prompt_chars": sum(len(m.get("content", "")) for m in messages),
+                "model": res.model or "-",
                 "request_id": request_id or "-",
             },
         )
-        return res.text
+        return res

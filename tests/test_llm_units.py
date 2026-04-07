@@ -11,9 +11,15 @@ import pytest
 
 from sensor_app.lib.metrics_store import StoredSnapshot
 from sensor_app.llm import service as llm_service_module
-from sensor_app.llm.client import OpenAICompatibleChatBackend, _parse_chat_json, extract_json_object
+from sensor_app.llm.client import (
+    OpenAICompatibleChatBackend,
+    PrimaryWithFallbackBackend,
+    _parse_chat_json,
+    extract_json_object,
+    should_try_fallback,
+)
 from sensor_app.llm.context import dumps_bounded, snapshot_metrics_context
-from sensor_app.llm.exceptions import LLMTimeoutError, LLMUpstreamError
+from sensor_app.llm.exceptions import LLMError, LLMTimeoutError, LLMUpstreamError
 from sensor_app.llm.query_execute import (
     aggregate_values,
     collect_numeric_series,
@@ -184,13 +190,27 @@ def test_parse_chat_json_and_errors() -> None:
         {
             "choices": [{"message": {"content": " hi "}}],
             "usage": {"prompt_tokens": 3, "completion_tokens": 7},
-        }
+        },
+        configured_model="gpt-test",
     )
     assert r.text == "hi" and r.prompt_tokens == 3 and r.completion_tokens == 7
-    r2 = _parse_chat_json({"choices": [{"message": {"content": [1, 2]}}]})
+    assert r.model == "gpt-test"
+    r2 = _parse_chat_json(
+        {"choices": [{"message": {"content": [1, 2]}}]},
+        configured_model="m",
+    )
     assert r2.text == "[1, 2]"
+    assert r2.model == "m"
     with pytest.raises(LLMUpstreamError):
-        _parse_chat_json({})
+        _parse_chat_json({}, configured_model="x")
+    r_api = _parse_chat_json(
+        {
+            "choices": [{"message": {"content": "ok"}}],
+            "model": "gpt-4o-mini-2024-07-18",
+        },
+        configured_model="fallback-id",
+    )
+    assert r_api.model == "gpt-4o-mini-2024-07-18"
 
 
 def test_openai_backend_client_error_no_retry() -> None:
@@ -334,11 +354,12 @@ def test_llm_feature_service_empty_snaps_skips_backend() -> None:
             schema_path="sensor_schema.json",
             llm_enabled=False,
             llm_api_key="",
+            llm_fallback_enabled=False,
         ),
     )
 
     async def _run() -> None:
-        ans, facts = await svc.natural_language_query("q?", [], request_id=None)
+        ans, facts, _m = await svc.natural_language_query("q?", [], request_id=None)
         assert not called
         assert facts["n_values"] == 0
         assert "No numeric" in ans
@@ -361,6 +382,7 @@ def test_llm_feature_service_one_shot_logs_on_llm_error() -> None:
             schema_path="sensor_schema.json",
             llm_enabled=False,
             llm_api_key="",
+            llm_fallback_enabled=False,
         ),
     )
     snap = _snap(metrics={"devices": []})
@@ -378,3 +400,77 @@ def test_llm_feature_service_one_shot_logs_on_llm_error() -> None:
     assert extra["outcome"] == "error"
     assert extra["error"] == "LLMTimeoutError"
     assert extra["request_id"] == "rid"
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (LLMTimeoutError(), True),
+        (LLMUpstreamError("u", status_code=503), True),
+        (LLMUpstreamError("u", status_code=429), True),
+        (LLMUpstreamError("u", status_code=None), True),
+        (LLMUpstreamError("u", status_code=401), False),
+        (LLMUpstreamError("u", status_code=400), False),
+        (LLMUpstreamError("u", status_code=404), False),
+        (LLMUpstreamError("u", status_code=422), False),
+        (LLMError("other"), False),
+    ],
+)
+def test_should_try_fallback(exc: LLMError, expected: bool) -> None:
+    assert should_try_fallback(exc) is expected
+
+
+def test_primary_with_fallback_uses_secondary_on_timeout() -> None:
+    class FailPrimary:
+        async def chat_completion(self, *a: Any, **k: Any) -> ChatResult:
+            raise LLMTimeoutError()
+
+    class OkSecondary:
+        async def chat_completion(self, *a: Any, **k: Any) -> ChatResult:
+            return ChatResult(text="secondary-ok", model="llama-fallback")
+
+    fb = PrimaryWithFallbackBackend(FailPrimary(), OkSecondary())
+
+    async def _run() -> None:
+        r = await fb.chat_completion([{"role": "user", "content": "x"}], request_id="t1")
+        assert r.text == "secondary-ok"
+        assert r.model == "llama-fallback"
+
+    asyncio.run(_run())
+
+
+def test_primary_with_fallback_does_not_call_secondary_on_401() -> None:
+    class Fail401:
+        async def chat_completion(self, *a: Any, **k: Any) -> ChatResult:
+            raise LLMUpstreamError("auth", status_code=401)
+
+    class Never:
+        async def chat_completion(self, *a: Any, **k: Any) -> ChatResult:
+            raise AssertionError("secondary must not run")
+
+    fb = PrimaryWithFallbackBackend(Fail401(), Never())
+
+    async def _run() -> None:
+        with pytest.raises(LLMUpstreamError):
+            await fb.chat_completion([])
+
+    asyncio.run(_run())
+
+
+def test_primary_with_fallback_primary_success_skips_secondary() -> None:
+    class OkPrimary:
+        async def chat_completion(self, *a: Any, **k: Any) -> ChatResult:
+            return ChatResult(text="p", model="gpt-primary")
+
+    class Never:
+        async def chat_completion(self, *a: Any, **k: Any) -> ChatResult:
+            raise AssertionError("secondary must not run")
+
+    fb = PrimaryWithFallbackBackend(OkPrimary(), Never())
+
+    async def _run() -> None:
+        r = await fb.chat_completion([])
+        assert r.text == "p"
+        assert r.model == "gpt-primary"
+
+    asyncio.run(_run())

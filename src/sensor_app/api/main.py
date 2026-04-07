@@ -7,7 +7,8 @@
 and **slowapi** rate limits per route (see :class:`sensor_app.settings.Settings`).
 
 Routes: ``GET /`` (index), ``GET /health``, ``POST /process/{station_id}``,
-``GET /metrics/{station_id}``, LLM routes under ``POST /llm/*`` (plus FastAPI ``/docs``).
+``GET /metrics/{station_id}``, LLM routes under ``POST /llm/*`` (OpenAI-compatible providers
+e.g. OpenAI, Groq, self-hosted; optional primary+fallback chain) plus FastAPI ``/docs``.
 """
 
 from __future__ import annotations
@@ -30,7 +31,11 @@ from starlette.responses import Response
 from sensor_app.api.middleware import RequestIdMiddleware, configure_app_logging
 from sensor_app.lib.metrics_store import MetricsStore, StoredSnapshot
 from sensor_app.lib.pipeline import MissingDataStrategy, PipelineConfig, run_station_pipeline
-from sensor_app.llm.client import LLMBackend, OpenAICompatibleChatBackend
+from sensor_app.llm.client import (
+    LLMBackend,
+    OpenAICompatibleChatBackend,
+    PrimaryWithFallbackBackend,
+)
 from sensor_app.llm.exceptions import LLMError
 from sensor_app.llm.service import LLMFeatureService
 from sensor_app.settings import Settings
@@ -79,7 +84,7 @@ class LLMQueryBody(BaseModel):
 
 
 class LLMTextSummaryResponse(BaseModel):
-    """NL summary from the configured chat model."""
+    """NL summary; ``model`` is the host model id that produced the text (primary or fallback)."""
 
     summary: str
     snapshot_id: int
@@ -87,7 +92,7 @@ class LLMTextSummaryResponse(BaseModel):
 
 
 class LLMQueryResponse(BaseModel):
-    """Deterministic **answer** string from computed **facts** (plan from LLM, numbers from Python)."""
+    """Answer from Python over stored metrics; ``model`` is the host that produced the JSON plan."""
 
     answer: str
     facts: dict[str, Any]
@@ -137,6 +142,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.store = store
     app.state.llm_http_client = None
     app.state.llm_backend = None
+    llm_fallback_configured = False
     override = cast(LLMBackend | None, getattr(app.state, "llm_backend_override", None))
     if override is not None:
         app.state.llm_backend = override
@@ -144,7 +150,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         timeout = httpx.Timeout(settings.llm_timeout_seconds)
         client = httpx.AsyncClient(timeout=timeout)
         app.state.llm_http_client = client
-        app.state.llm_backend = OpenAICompatibleChatBackend(
+        primary = OpenAICompatibleChatBackend(
             client=client,
             base_url=settings.llm_base_url,
             api_key=settings.llm_api_key,
@@ -152,12 +158,30 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             max_retries=settings.llm_max_retries,
             backoff_base_ms=settings.llm_backoff_base_ms,
         )
+        fb_url = settings.llm_fallback_base_url.strip()
+        fb_model = settings.llm_fallback_model.strip()
+        use_fb = settings.llm_fallback_enabled and bool(fb_url) and bool(fb_model)
+        if use_fb:
+            fb_key = settings.llm_fallback_api_key.strip() or settings.llm_api_key
+            secondary = OpenAICompatibleChatBackend(
+                client=client,
+                base_url=fb_url,
+                api_key=fb_key,
+                model=fb_model,
+                max_retries=settings.llm_max_retries,
+                backoff_base_ms=settings.llm_backoff_base_ms,
+            )
+            app.state.llm_backend = PrimaryWithFallbackBackend(primary, secondary)
+            llm_fallback_configured = True
+        else:
+            app.state.llm_backend = primary
     logger.info(
         "sensor_app started",
         extra={
             "sensor_db": settings.sensor_db_path,
             "metrics_db": settings.metrics_db_path,
             "llm": "on" if app.state.llm_backend is not None else "off",
+            "llm_fallback": llm_fallback_configured,
         },
     )
     try:
@@ -313,12 +337,11 @@ async def llm_metrics_summary_endpoint(
     body: LLMStationWindowBody,
 ) -> LLMTextSummaryResponse:
     """Plain-English operational summary from stored per-device metrics (LLM prose)."""
-    settings_dep = get_settings(request)
     store: MetricsStore = request.app.state.store
     snap = await _resolve_snapshot(store, body)
     svc = _llm_features_or_503(request)
     try:
-        text = await svc.natural_language_metrics_summary(
+        text, model_used = await svc.natural_language_metrics_summary(
             snap,
             request_id=_request_id(request),
         )
@@ -327,7 +350,7 @@ async def llm_metrics_summary_endpoint(
     return LLMTextSummaryResponse(
         summary=text,
         snapshot_id=snap.id,
-        model=settings_dep.llm_model,
+        model=model_used,
     )
 
 
@@ -336,12 +359,11 @@ async def llm_data_quality_summary_endpoint(
     body: LLMStationWindowBody,
 ) -> LLMTextSummaryResponse:
     """Plain-English data-quality summary grounded in stored ``data_quality`` JSON."""
-    settings_dep = get_settings(request)
     store: MetricsStore = request.app.state.store
     snap = await _resolve_snapshot(store, body)
     svc = _llm_features_or_503(request)
     try:
-        text = await svc.natural_language_dq_summary(
+        text, model_used = await svc.natural_language_dq_summary(
             snap,
             request_id=_request_id(request),
         )
@@ -350,7 +372,7 @@ async def llm_data_quality_summary_endpoint(
     return LLMTextSummaryResponse(
         summary=text,
         snapshot_id=snap.id,
-        model=settings_dep.llm_model,
+        model=model_used,
     )
 
 
@@ -375,14 +397,14 @@ async def llm_query_endpoint(
     )
     svc = _llm_features_or_503(request)
     try:
-        answer, facts = await svc.natural_language_query(
+        answer, facts, model_used = await svc.natural_language_query(
             body.question,
             snaps,
             request_id=_request_id(request),
         )
     except LLMError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
-    return LLMQueryResponse(answer=answer, facts=facts, model=settings_dep.llm_model)
+    return LLMQueryResponse(answer=answer, facts=facts, model=model_used)
 
 
 def _mount_routes(app: FastAPI, settings: Settings) -> None:

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sensor-app"
 version = "0.1.0"
-description = "Industrial IoT sensor ingestion and metrics service (sensor_app)"
+description = "Industrial IoT sensor ingestion and metrics API (sensor_app); OpenAI-compatible LLM routes (Groq, self-hosted, …)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

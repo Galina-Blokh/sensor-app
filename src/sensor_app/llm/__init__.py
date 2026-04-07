@@ -1,6 +1,15 @@
-"""LLM integration layer (swappable backend, structured metric access for NL query)."""
+"""LLM integration: OpenAI-compatible chat (OpenAI, Groq, self-hosted, …), optional fallback chain."""
 
-from sensor_app.llm.client import LLMBackend, OpenAICompatibleChatBackend
+from sensor_app.llm.client import (
+    LLMBackend,
+    OpenAICompatibleChatBackend,
+    PrimaryWithFallbackBackend,
+)
 from sensor_app.llm.service import LLMFeatureService
 
-__all__ = ["LLMBackend", "LLMFeatureService", "OpenAICompatibleChatBackend"]
+__all__ = [
+    "LLMBackend",
+    "LLMFeatureService",
+    "OpenAICompatibleChatBackend",
+    "PrimaryWithFallbackBackend",
+]

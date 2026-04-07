@@ -30,8 +30,8 @@ class Settings(BaseSettings):
         rate_limit_metrics: Limit for ``GET /metrics/{station_id}``.
         llm_enabled: When true and ``llm_api_key`` is set, LLM routes use the HTTP backend.
         llm_api_key: Bearer token for the OpenAI-compatible chat API (never log).
-        llm_base_url: Provider base URL (e.g. ``https://api.openai.com/v1``).
-        llm_model: Chat model id passed to the provider.
+        llm_base_url: API base including ``/v1`` (OpenAI, Groq, self-hosted, …).
+        llm_model: Model id accepted by that host (e.g. ``gpt-4o-mini``, Groq ``llama-3.1-8b-instant``).
         llm_timeout_seconds: Per-request HTTP timeout for LLM calls.
         llm_max_retries: Retries on 429 / 5xx after the first attempt.
         llm_backoff_base_ms: Initial backoff before retries (exponential growth).
@@ -40,6 +40,11 @@ class Settings(BaseSettings):
         rate_limit_llm_summary: slowapi limit for ``POST /llm/metrics-summary``.
         rate_limit_llm_query: Limit for ``POST /llm/query``.
         rate_limit_llm_dq: Limit for ``POST /llm/data-quality-summary``.
+        llm_fallback_enabled: When true (default) and fallback URL/model are set, call a **secondary**
+            host after primary **transient** failures. Set to **false** to use primary only.
+        llm_fallback_base_url: Secondary base (e.g. Groq or local OpenAI-compatible URL).
+        llm_fallback_api_key: Secondary bearer; if empty, **primary** ``llm_api_key`` is reused.
+        llm_fallback_model: Secondary model id for that host.
     """
 
     model_config = SettingsConfigDict(
@@ -73,3 +78,7 @@ class Settings(BaseSettings):
     rate_limit_llm_summary: str = "30/minute"
     rate_limit_llm_query: str = "30/minute"
     rate_limit_llm_dq: str = "30/minute"
+    llm_fallback_enabled: bool = True
+    llm_fallback_base_url: str = ""
+    llm_fallback_api_key: str = ""
+    llm_fallback_model: str = ""

@@ -31,6 +31,10 @@ def _settings_with_llm_limits(repo_root: Path, **overrides: Any) -> Settings:
         "rate_limit_llm_dq": "10000/minute",
         "llm_enabled": False,
         "llm_api_key": "",
+        "llm_fallback_enabled": False,
+        "llm_fallback_base_url": "",
+        "llm_fallback_model": "",
+        "llm_fallback_api_key": "",
     }
     base.update(overrides)
     return Settings(**base)
@@ -200,6 +204,7 @@ def test_openai_compatible_backend_retries_on_429() -> None:
             )
         assert res.text == "done"
         assert res.prompt_tokens == 1
+        assert res.model == "m"
         assert n["hits"] == 3
 
     asyncio.run(_run())

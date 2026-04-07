@@ -1,4 +1,8 @@
-"""OpenAI-compatible chat client over ``httpx`` with async retries and backoff."""
+"""OpenAI-compatible chat client (``POST …/chat/completions``) over ``httpx``.
+
+Works with any host that matches that JSON API (OpenAI, Groq, vLLM, …).
+Includes retries/backoff and optional :class:`PrimaryWithFallbackBackend` for a second model/host.
+"""
 
 from __future__ import annotations
 
@@ -30,6 +34,58 @@ class LLMBackend(Protocol):
 
 def _retryable_status(code: int) -> bool:
     return code == 429 or code >= 500
+
+
+def should_try_fallback(exc: LLMError) -> bool:
+    """Whether a failed **primary** chat call may be retried on a secondary (local/cheap) model."""
+    if isinstance(exc, LLMTimeoutError):
+        return True
+    if isinstance(exc, LLMUpstreamError):
+        code = exc.status_code
+        if code is None:
+            return True
+        if code in (400, 401, 403, 404, 422):
+            return False
+        return True
+    return False
+
+
+class PrimaryWithFallbackBackend:
+    """Try **primary** backend first; on transient failure, call **secondary** once (same messages)."""
+
+    def __init__(self, primary: LLMBackend, secondary: LLMBackend) -> None:
+        self._primary = primary
+        self._secondary = secondary
+
+    async def chat_completion(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_completion_tokens: int = 512,
+        request_id: str | None = None,
+    ) -> ChatResult:
+        try:
+            return await self._primary.chat_completion(
+                messages,
+                max_completion_tokens=max_completion_tokens,
+                request_id=request_id,
+            )
+        except LLMError as e:
+            if not should_try_fallback(e):
+                raise
+            logger.warning(
+                "llm_fallback_invoked",
+                extra={
+                    "request_id": request_id or "-",
+                    "primary_error": type(e).__name__,
+                    "primary_status": getattr(e, "status_code", None),
+                },
+            )
+            return await self._secondary.chat_completion(
+                messages,
+                max_completion_tokens=max_completion_tokens,
+                request_id=request_id,
+            )
 
 
 class OpenAICompatibleChatBackend:
@@ -76,7 +132,7 @@ class OpenAICompatibleChatBackend:
             try:
                 resp = await self._client.post(url, headers=headers, json=body)
                 if resp.status_code == 200:
-                    return _parse_chat_json(resp.json())
+                    return _parse_chat_json(resp.json(), configured_model=self._model)
                 if _retryable_status(resp.status_code) and attempt < self._max_retries:
                     delay = (self._backoff_base_ms / 1000.0) * (2**attempt)
                     logger.warning(
@@ -118,7 +174,7 @@ class OpenAICompatibleChatBackend:
         raise LLMTimeoutError() from last_err
 
 
-def _parse_chat_json(data: Any) -> ChatResult:
+def _parse_chat_json(data: Any, *, configured_model: str) -> ChatResult:
     try:
         choices = data["choices"]
         msg = choices[0]["message"]
@@ -127,10 +183,17 @@ def _parse_chat_json(data: Any) -> ChatResult:
         usage = data.get("usage") or {}
         pt = usage.get("prompt_tokens")
         ct = usage.get("completion_tokens")
+        api_model = data.get("model")
+        resolved = (
+            api_model.strip()
+            if isinstance(api_model, str) and api_model.strip()
+            else configured_model
+        )
         return ChatResult(
             text=text.strip(),
             prompt_tokens=int(pt) if isinstance(pt, int) else None,
             completion_tokens=int(ct) if isinstance(ct, int) else None,
+            model=resolved,
         )
     except (KeyError, IndexError, TypeError, ValueError) as e:
         raise LLMUpstreamError("LLM response shape unexpected") from e

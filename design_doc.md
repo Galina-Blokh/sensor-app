@@ -38,10 +38,10 @@ This submission uses **SQLite** and **thread-offloaded Polars/NumPy** for clarit
 
 ## 7. spec_ch2 — LLM integration (brief)
 
-**Architecture:** `sensor_app.llm` holds an **OpenAI-compatible** chat client (`httpx.AsyncClient`, timeouts, retries with backoff). FastAPI routes under **`POST /llm/*`** call that layer; they do **not** embed vendor SDKs in handlers.
+**Architecture:** `sensor_app.llm` holds an **OpenAI-compatible** chat client (`httpx.AsyncClient`, timeouts, retries with backoff). The HTTP shape is **`POST {base}/v1/chat/completions`** (same as OpenAI’s API), so **any** compatible host works (examples: **OpenAI**, **Groq**, self-hosted stacks). FastAPI routes under **`POST /llm/*`** call that layer; they do **not** embed vendor SDKs in handlers. **`PrimaryWithFallbackBackend`** chains a second host after **transient** primary failure.
 
 **Data access:** Snapshots load only through **`MetricsStore`** (parameterized SQL). NL **query** uses a model-produced **JSON plan** validated against allowlisted metric keys and aggregations; **numeric answers** come from Python over stored JSON, not SQL built from free text.
 
-**Failure modes:** LLM disabled or missing key → **503**; provider/parse failures → **502**. **Cost / abuse:** input length caps, per-route rate limits, no full prompt logging (see README).
+**Failure modes:** LLM disabled or missing key → **503**; provider/parse failures → **502**. **Fallback:** `SENSOR_APP_LLM_FALLBACK_*` wires a second base URL + model (e.g. **Groq** after **OpenAI**); it is **on by default** when URL+model are set—primary is always tried first, then one secondary call after transient primary failure (see README). **Cost / abuse:** input length caps, per-route rate limits, no full prompt logging (see README).
 
-**Tests:** `tests/test_llm.py` mocks the backend (no live API in CI). **Configuration:** README environment table (`SENSOR_APP_LLM_*`).
+**Tests:** `tests/test_llm.py` and `tests/test_llm_units.py` mock backends and exercise retries/fallback logic (no live API in CI). **Configuration:** README + **`.env.example`** (`SENSOR_APP_LLM_*`).

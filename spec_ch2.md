@@ -40,7 +40,7 @@ The integration **must** stay **maintainable**: clear boundaries, minimal coupli
 
 The **`README.md`** (or a linked doc) **must** list:
 
-* How to configure the LLM (environment variables, keys, base URLs, model id).
+* How to configure the LLM (environment variables, keys, base URLs, model id). Document that the wire protocol is **OpenAI-compatible** so **any** matching host applies; **`.env.example`** lists primary and optional fallback variables (README has provider URL/model examples).
 * How to run the test suite including LLM-related tests.
 * How to **skip** LLM integration tests in environments without credentials, if applicable.
 

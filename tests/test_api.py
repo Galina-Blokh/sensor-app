@@ -27,6 +27,10 @@ def _settings_minimal(repo_root: Path, **overrides: Any) -> Settings:
         "rate_limit_llm_dq": "10000/minute",
         "llm_enabled": False,
         "llm_api_key": "",
+        "llm_fallback_enabled": False,
+        "llm_fallback_base_url": "",
+        "llm_fallback_model": "",
+        "llm_fallback_api_key": "",
     }
     cfg.update(overrides)
     return Settings(**cfg)
@@ -67,6 +71,7 @@ def test_process_and_get_metrics(
             rate_limit_metrics="10000/minute",
             llm_enabled=False,
             llm_api_key="",
+            llm_fallback_enabled=False,
         )
     )
     with TestClient(app) as client:
@@ -116,6 +121,7 @@ def test_process_schema_missing_returns_500(tmp_path: Path, sensor_db_path: str)
             rate_limit_metrics="10000/minute",
             llm_enabled=False,
             llm_api_key="",
+            llm_fallback_enabled=False,
         )
     )
     with TestClient(app) as client:
