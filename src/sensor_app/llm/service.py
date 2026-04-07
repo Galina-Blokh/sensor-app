@@ -39,13 +39,18 @@ _SYSTEM_DQ_SUMMARY = (
 )
 
 _SYSTEM_QUERY_PLANNER = (
-    "You map user questions to a single structured query over per-device metric values. "
+    "You map user questions to a single structured query over per-device scalars in each "
+    "snapshot's devices[].values. Each snapshot may also include data_quality (missing fractions, "
+    "out_of_range_count_by_column, flatlines): use that textually when choosing intent, but "
+    "metric_key must still be one of the allowed device metric keys—there is no separate key for "
+    "DQ counts. Prefer reading_count or pressure_std_bar when the user asks about volume or "
+    "variability; uptime_seconds / cycle_count for runtime; total_flow_volume_m3 or "
+    "specific_power_kw_per_m3h for flow or power; average_pressure_bar or peak_pressure_bar only "
+    "when they clearly ask about pressure or discharge head. "
     "Reply with ONE JSON object only, no markdown, keys: "
     "metric_key (string, one of the allowed keys), agg (one of mean|max|min|sum|latest), "
     "device_id (string or null for all devices). "
-    "Choose metric_key and agg that best match the question. "
-    "If the question cannot be answered from device metrics, use metric_key "
-    '"average_pressure_bar" and agg "mean" anyway (caller will show empty result).'
+    "Do not default to average_pressure_bar for unrelated questions."
 )
 
 

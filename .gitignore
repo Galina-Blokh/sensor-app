@@ -36,6 +36,8 @@ htmlcov/
 # .python-version
 
 # OS / editors
+# Windows reserved name; accidental `> nul` misuse creates this file
+nul
 .DS_Store
 Thumbs.db
 *.swp

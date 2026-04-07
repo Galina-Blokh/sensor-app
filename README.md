@@ -24,6 +24,9 @@ See **spec_ch1.md** for the full product spec; **spec_ch2.md** for the LLM integ
 ├── .github/workflows/ci.yml    # GitHub Actions
 ├── pyproject.toml / uv.lock
 ├── .env.example               # LLM/provider template (copy to .env; .env is gitignored)
+├── docs/
+│   └── api/
+│       └── README.md           # per-route API guide (add demo videos per path)
 ├── Makefile
 ├── design_doc.md               # “take-home” design answers + production notes
 ├── spec_ch1.md                 # internal product spec for Challenge 1
@@ -74,23 +77,11 @@ make run
 # alternate port: make run PORT=8001
 ```
 
-- Index: `GET /` — short JSON map of routes (optional convenience).
-- OpenAPI: `http://127.0.0.1:8000/docs`
-- Health: `GET /health`
-- Process station: `POST /process/{station_id}?start_time=&end_time=` (ISO-8601, optional)
-- Read snapshots: `GET /metrics/{station_id}?start_time=&end_time=&device_id=`
+**Per-route guide (add your demo videos there):** **[docs/api/README.md](docs/api/README.md)** — purpose, when to use each LLM route, examples, and a **Video** placeholder under every path. **OpenAPI / try-it-out:** `http://127.0.0.1:8000/docs`.
 
-### LLM endpoints (spec_ch2)
+### LLM layer (spec_ch2)
 
-NL features use a **dedicated** `sensor_app.llm` layer (`httpx.AsyncClient` + OpenAI-compatible **`POST .../chat/completions`**). Handlers load metrics only via **`MetricsStore`** (parameterized SQL); the NL **query** path has the model emit a **JSON plan** (allowlisted metric keys and aggregations), then **numbers are computed in Python** from stored snapshot JSON—no SQL built from user or model text.
-
-| Route | Purpose |
-|-------|---------|
-| `POST /llm/metrics-summary` | Plain-English **operational** summary from stored per-device metrics |
-| `POST /llm/data-quality-summary` | Plain-English summary from stored **`data_quality`** (pipeline output) |
-| `POST /llm/query` | NL question → model **plan** → validated aggregation over stored metrics |
-
-Bodies (JSON): **`metrics-summary`** and **`data-quality-summary`** accept `station_id`, optional `snapshot_id`, optional `start_time` / `end_time` (same semantics as `GET /metrics` for picking the newest row in a window). **`query`** accepts `station_id`, `question`, optional `start_time` / `end_time`.
+NL features use **`sensor_app.llm`** (`httpx.AsyncClient`, OpenAI-compatible **`POST …/chat/completions`**). **`MetricsStore`** only via parameterized SQL; **`/llm/query`** uses a validated JSON plan and **Python** aggregation (see **docs/api/README.md** and **spec_ch2.md**).
 
 **When the LLM is off or misconfigured:** routes return **503** with a short detail (set env vars below). **Provider failures** (timeout, HTTP errors, bad response shape) return **502**.
 
