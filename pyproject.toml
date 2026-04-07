@@ -83,3 +83,8 @@ python_classes = "Test*"
 python_functions = "test_*"
 pythonpath = ["src"]
 addopts = "-v --cov=sensor_app"
+# Starlette TestClient lifespan teardown → anyio/asyncio still pass cancel(msg=...) (deprecated 3.11+).
+filterwarnings = [
+    "ignore:Passing 'msg' argument to Task\\.cancel\\(\\):DeprecationWarning",
+    "ignore:Passing 'msg' argument to Future\\.cancel\\(\\):DeprecationWarning",
+]

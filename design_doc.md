@@ -35,3 +35,13 @@ This submission uses **SQLite** and **thread-offloaded Polars/NumPy** for clarit
 | Idempotency | Snapshot upsert by station + window | — |
 | Capacity / cost | — | Documented: full-window scans costly; incremental in prod |
 | Retention / DR | — | Raw vs aggregate retention; backup/restore for metrics DB |
+
+## 7. spec_ch2 — LLM integration (brief)
+
+**Architecture:** `sensor_app.llm` holds an **OpenAI-compatible** chat client (`httpx.AsyncClient`, timeouts, retries with backoff). FastAPI routes under **`POST /llm/*`** call that layer; they do **not** embed vendor SDKs in handlers.
+
+**Data access:** Snapshots load only through **`MetricsStore`** (parameterized SQL). NL **query** uses a model-produced **JSON plan** validated against allowlisted metric keys and aggregations; **numeric answers** come from Python over stored JSON, not SQL built from free text.
+
+**Failure modes:** LLM disabled or missing key → **503**; provider/parse failures → **502**. **Cost / abuse:** input length caps, per-route rate limits, no full prompt logging (see README).
+
+**Tests:** `tests/test_llm.py` mocks the backend (no live API in CI). **Configuration:** README environment table (`SENSOR_APP_LLM_*`).

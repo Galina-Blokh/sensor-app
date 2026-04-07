@@ -92,6 +92,28 @@ class MetricsStore:
                 raise RuntimeError("SQLite INSERT did not set lastrowid")
             return int(row_id)
 
+    def get_snapshot_by_id(self, station_id: str, snapshot_id: int) -> StoredSnapshot | None:
+        """Load one snapshot by primary key, scoped to **station_id** (parameterized)."""
+        q = (
+            "SELECT id, station_id, window_start, window_end, computed_at, "
+            "data_quality_json, metrics_json FROM metric_snapshots "
+            "WHERE id = ? AND station_id = ?"
+        )
+        with sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(q, (int(snapshot_id), station_id)).fetchone()
+        if row is None:
+            return None
+        return StoredSnapshot(
+            id=int(row["id"]),
+            station_id=row["station_id"],
+            window_start=row["window_start"],
+            window_end=row["window_end"],
+            computed_at=row["computed_at"],
+            data_quality=json.loads(row["data_quality_json"]),
+            metrics=json.loads(row["metrics_json"]),
+        )
+
     def list_snapshots(
         self,
         station_id: str,

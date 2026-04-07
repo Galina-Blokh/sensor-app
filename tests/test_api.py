@@ -22,6 +22,11 @@ def _settings_minimal(repo_root: Path, **overrides: Any) -> Settings:
         "rate_limit_health": "10000/minute",
         "rate_limit_process": "10000/minute",
         "rate_limit_metrics": "10000/minute",
+        "rate_limit_llm_summary": "10000/minute",
+        "rate_limit_llm_query": "10000/minute",
+        "rate_limit_llm_dq": "10000/minute",
+        "llm_enabled": False,
+        "llm_api_key": "",
     }
     cfg.update(overrides)
     return Settings(**cfg)
@@ -60,6 +65,8 @@ def test_process_and_get_metrics(
             rate_limit_health="10000/minute",
             rate_limit_process="10000/minute",
             rate_limit_metrics="10000/minute",
+            llm_enabled=False,
+            llm_api_key="",
         )
     )
     with TestClient(app) as client:
@@ -107,6 +114,8 @@ def test_process_schema_missing_returns_500(tmp_path: Path, sensor_db_path: str)
             rate_limit_health="10000/minute",
             rate_limit_process="10000/minute",
             rate_limit_metrics="10000/minute",
+            llm_enabled=False,
+            llm_api_key="",
         )
     )
     with TestClient(app) as client:

@@ -2,7 +2,7 @@
 
 Industrial compressed-air **sensor ingestion** (`sensor_app.lib`) and a **metrics HTTP API** (`sensor_app.api`) built with **FastAPI**. Ingestion and metrics use **Polars** (and **NumPy** for flatline run scans in the pipeline); CPU-heavy work runs in a **thread pool** via `asyncio.to_thread` so the event loop stays responsive.
 
-See **spec_ch1.md** for the full product spec; **design_doc.md** for monorepo distribution, schema evolution, CI/CD, and production deferrals.
+See **spec_ch1.md** for the full product spec; **spec_ch2.md** for the LLM integration; **design_doc.md** for monorepo distribution, schema evolution, CI/CD, and production deferrals.
 
 ## Project structure
 
@@ -18,6 +18,7 @@ See **spec_ch1.md** for the full product spec; **design_doc.md** for monorepo di
 │   ├── api/
 │   │   ├── main.py             # FastAPI app, routes, slowapi limits
 │   │   └── middleware.py       # X-Request-ID + logging filter
+│   ├── llm/                    # OpenAI-compatible client + NL features (spec_ch2)
 │   └── settings.py             # pydantic-settings (SENSOR_APP_*)
 ├── tests/                      # unit + integration (see Tests)
 ├── .github/workflows/ci.yml    # GitHub Actions
@@ -25,6 +26,7 @@ See **spec_ch1.md** for the full product spec; **design_doc.md** for monorepo di
 ├── Makefile
 ├── design_doc.md               # “take-home” design answers + production notes
 ├── spec_ch1.md                 # internal product spec for Challenge 1
+├── spec_ch2.md                 # LLM endpoints + ops (Challenge 2)
 └── sensor_schema.json          # committed; sensor_data.db is local only (see below)
 ```
 
@@ -33,7 +35,8 @@ See **spec_ch1.md** for the full product spec; **design_doc.md** for monorepo di
 1. **Library (`sensor_app.lib`)** — Single entrypoint `run_station_pipeline(...)`: reads via `SensorReadingSource`, validates against `LoadedSchema`, applies missing-data strategy, resamples, emits a **data-quality** report, computes **metrics** in Polars. No HTTP imports; callers can be batch jobs or the API.
 2. **API (`sensor_app.api`)** — Thin FastAPI layer: **`async def`** handlers call **`asyncio.to_thread`** for the pipeline and for SQLite metric writes so the event loop is not blocked. **slowapi** enforces per-route limits; **RequestIdMiddleware** adds **`X-Request-ID`** and log correlation.
 3. **Persistence** — Raw readings: **`sensor_data.db`**. Computed snapshots: **`metrics.db`** table **`metric_snapshots`** (upsert by station + window for idempotency).
-4. **Broader “system” and ops** — Versioning, schema evolution, full CD, auth, tracing, and SLOs are described in **design_doc.md** and the README **Scope & next steps** section.
+4. **LLM layer (`sensor_app.llm`)** — OpenAI-compatible **`httpx.AsyncClient`**, **`LLMBackend`** protocol, **`LLMFeatureService`** orchestration; **`POST /llm/*`** resolves snapshots via **`MetricsStore`** only; NL **query** uses a validated JSON plan plus **Python** aggregation (see **spec_ch2.md** and the LLM section below).
+5. **Broader “system” and ops** — Versioning, schema evolution, full CD, auth, tracing, and SLOs are described in **design_doc.md** and the README **Scope & next steps** section.
 
 ## Prerequisites
 
@@ -76,6 +79,24 @@ make run
 - Process station: `POST /process/{station_id}?start_time=&end_time=` (ISO-8601, optional)
 - Read snapshots: `GET /metrics/{station_id}?start_time=&end_time=&device_id=`
 
+### LLM endpoints (spec_ch2)
+
+NL features use a **dedicated** `sensor_app.llm` layer (`httpx.AsyncClient` + OpenAI-compatible **`POST .../chat/completions`**). Handlers load metrics only via **`MetricsStore`** (parameterized SQL); the NL **query** path has the model emit a **JSON plan** (allowlisted metric keys and aggregations), then **numbers are computed in Python** from stored snapshot JSON—no SQL built from user or model text.
+
+| Route | Purpose |
+|-------|---------|
+| `POST /llm/metrics-summary` | Plain-English **operational** summary from stored per-device metrics |
+| `POST /llm/data-quality-summary` | Plain-English summary from stored **`data_quality`** (pipeline output) |
+| `POST /llm/query` | NL question → model **plan** → validated aggregation over stored metrics |
+
+Bodies (JSON): **`metrics-summary`** and **`data-quality-summary`** accept `station_id`, optional `snapshot_id`, optional `start_time` / `end_time` (same semantics as `GET /metrics` for picking the newest row in a window). **`query`** accepts `station_id`, `question`, optional `start_time` / `end_time`.
+
+**When the LLM is off or misconfigured:** routes return **503** with a short detail (set env vars below). **Provider failures** (timeout, HTTP errors, bad response shape) return **502**.
+
+**Live provider:** set `SENSOR_APP_LLM_ENABLED=true` and `SENSOR_APP_LLM_API_KEY`. **Retries** with exponential backoff apply to **429** and **5xx**. Logs record **latency** and token usage when the API returns `usage`; full prompts are **not** logged (only sizes / outcomes).
+
+**Cost control (production):** this build relies on **timeouts**, **rate limits**, and **bounded context** (`SENSOR_APP_LLM_MAX_CONTEXT_CHARS`). For heavy traffic, add **caching** keyed by `(snapshot_id, endpoint, prompt hash)` or an async job queue; not implemented here.
+
 ### Request correlation
 
 - Every response includes **`X-Request-ID`**. Send your own UUID (or trace id) in **`X-Request-ID`** to correlate with upstream systems; otherwise the server generates one.
@@ -101,6 +122,18 @@ Per-client limits use **slowapi** (in-memory; production would use Redis or a ga
 | `SENSOR_APP_RATE_LIMIT_HEALTH` | Limit for `GET /health` | `120/minute` |
 | `SENSOR_APP_RATE_LIMIT_PROCESS` | Limit for `POST /process/...` | `30/minute` |
 | `SENSOR_APP_RATE_LIMIT_METRICS` | Limit for `GET /metrics/...` | `60/minute` |
+| `SENSOR_APP_LLM_ENABLED` | Turn on HTTP LLM client for `/llm/*` | `false` |
+| `SENSOR_APP_LLM_API_KEY` | Bearer token (required if enabled) | *(empty)* |
+| `SENSOR_APP_LLM_BASE_URL` | Provider base URL | `https://api.openai.com/v1` |
+| `SENSOR_APP_LLM_MODEL` | Chat model id | `gpt-4o-mini` |
+| `SENSOR_APP_LLM_TIMEOUT_SECONDS` | Per-request timeout | `60` |
+| `SENSOR_APP_LLM_MAX_RETRIES` | Retries after first attempt (429 / 5xx) | `3` |
+| `SENSOR_APP_LLM_BACKOFF_BASE_MS` | Initial backoff before retry | `400` |
+| `SENSOR_APP_LLM_MAX_QUESTION_CHARS` | Max `question` length for `/llm/query` | `2000` |
+| `SENSOR_APP_LLM_MAX_CONTEXT_CHARS` | Max JSON sent to the model (truncated) | `80000` |
+| `SENSOR_APP_RATE_LIMIT_LLM_SUMMARY` | Limit for `POST /llm/metrics-summary` | `30/minute` |
+| `SENSOR_APP_RATE_LIMIT_LLM_QUERY` | Limit for `POST /llm/query` | `30/minute` |
+| `SENSOR_APP_RATE_LIMIT_LLM_DQ` | Limit for `POST /llm/data-quality-summary` | `30/minute` |
 
 ## Repository artifacts
 
@@ -129,14 +162,18 @@ Snapshots are stored in **`metric_snapshots`** (see `sensor_app.lib.metrics_stor
 ## Tests
 
 - **Unit** (no real DB): `tests/test_schema_defs.py`, `tests/test_metrics_compute.py`
+- **LLM wiring** (no API key; **mocked** backend + retry unit test): `tests/test_llm.py`
 - **Integration** (requires `sensor_data.db`): `tests/test_pipeline_integration.py`, `tests/test_api.py`
+
+There is **no separate “LLM credentials” suite** to skip: `tests/test_llm.py` does not call a real provider. Enable `SENSOR_APP_LLM_*` only when exercising `/llm/*` manually against a live API.
 
 ```bash
 uv run pytest tests/test_schema_defs.py tests/test_metrics_compute.py   # unit only
+uv run pytest tests/test_llm.py tests/test_api.py -q --no-cov            # API + LLM mocks
 uv run pytest                                                           # all
 ```
 
 ## Scope & next steps
 
-- **In scope (this repo):** spec_ch1 — Polars pipeline library, FastAPI metrics API, SQLite metrics store, `X-Request-ID` + structured log fields, per-route rate limits, tests, design note, GitHub Actions CI.
+- **In scope (this repo):** spec_ch1 — Polars pipeline library, FastAPI metrics API, SQLite metrics store, `X-Request-ID` + structured log fields, per-route rate limits, tests, design note, GitHub Actions CI. **spec_ch2** — LLM routes, `sensor_app.llm` client (timeouts/retries), structured NL query execution, mocked tests.
 - **Deferred / production (see design_doc.md):** OAuth2/JWT or mTLS on `/process` and `/metrics`; Redis-backed rate limits; Prometheus/OpenTelemetry (latency, error rate, pipeline duration); centralized JSON logging; HA Postgres/BigQuery instead of SQLite; multi-region DR and formal SLOs.

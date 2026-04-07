@@ -7,7 +7,7 @@
 and **slowapi** rate limits per route (see :class:`sensor_app.settings.Settings`).
 
 Routes: ``GET /`` (index), ``GET /health``, ``POST /process/{station_id}``,
-``GET /metrics/{station_id}`` (plus FastAPI ``/docs``).
+``GET /metrics/{station_id}``, LLM routes under ``POST /llm/*`` (plus FastAPI ``/docs``).
 """
 
 from __future__ import annotations
@@ -19,16 +19,20 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Annotated, Any, cast
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from starlette.responses import Response
 
 from sensor_app.api.middleware import RequestIdMiddleware, configure_app_logging
-from sensor_app.lib.metrics_store import MetricsStore
+from sensor_app.lib.metrics_store import MetricsStore, StoredSnapshot
 from sensor_app.lib.pipeline import MissingDataStrategy, PipelineConfig, run_station_pipeline
+from sensor_app.llm.client import LLMBackend, OpenAICompatibleChatBackend
+from sensor_app.llm.exceptions import LLMError
+from sensor_app.llm.service import LLMFeatureService
 from sensor_app.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -51,6 +55,43 @@ class ProcessResponse(BaseModel):
     window_start: str | None
     window_end: str | None
     data_quality_score: float
+
+
+class LLMStationWindowBody(BaseModel):
+    """Resolve stored metrics/DQ for **station_id**; optional window filters list order."""
+
+    station_id: str
+    snapshot_id: int | None = Field(
+        default=None,
+        description="Explicit row id; when omitted, uses newest snapshot in optional window",
+    )
+    start_time: str | None = Field(default=None, description="ISO8601 filter (see GET /metrics)")
+    end_time: str | None = Field(default=None, description="ISO8601 filter (see GET /metrics)")
+
+
+class LLMQueryBody(BaseModel):
+    """Plain-English question answered via structured metric access only."""
+
+    station_id: str
+    question: str = Field(..., min_length=1)
+    start_time: str | None = None
+    end_time: str | None = None
+
+
+class LLMTextSummaryResponse(BaseModel):
+    """NL summary from the configured chat model."""
+
+    summary: str
+    snapshot_id: int
+    model: str
+
+
+class LLMQueryResponse(BaseModel):
+    """Deterministic **answer** string from computed **facts** (plan from LLM, numbers from Python)."""
+
+    answer: str
+    facts: dict[str, Any]
+    model: str
 
 
 def get_settings(request: Request) -> Settings:
@@ -89,19 +130,42 @@ def pipeline_config_from_settings(settings: Settings) -> PipelineConfig:
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Ensure ``metric_snapshots`` exists before serving; log paths once."""
+    """Ensure ``metric_snapshots`` exists; optionally wire OpenAI-compatible LLM client."""
     settings: Settings = app.state.settings
     store = MetricsStore(settings.metrics_db_path)
     store.init()
     app.state.store = store
+    app.state.llm_http_client = None
+    app.state.llm_backend = None
+    override = cast(LLMBackend | None, getattr(app.state, "llm_backend_override", None))
+    if override is not None:
+        app.state.llm_backend = override
+    elif settings.llm_enabled and settings.llm_api_key.strip():
+        timeout = httpx.Timeout(settings.llm_timeout_seconds)
+        client = httpx.AsyncClient(timeout=timeout)
+        app.state.llm_http_client = client
+        app.state.llm_backend = OpenAICompatibleChatBackend(
+            client=client,
+            base_url=settings.llm_base_url,
+            api_key=settings.llm_api_key,
+            model=settings.llm_model,
+            max_retries=settings.llm_max_retries,
+            backoff_base_ms=settings.llm_backoff_base_ms,
+        )
     logger.info(
         "sensor_app started",
         extra={
             "sensor_db": settings.sensor_db_path,
             "metrics_db": settings.metrics_db_path,
+            "llm": "on" if app.state.llm_backend is not None else "off",
         },
     )
-    yield
+    try:
+        yield
+    finally:
+        hc = getattr(app.state, "llm_http_client", None)
+        if hc is not None:
+            await hc.aclose()
 
 
 async def root_endpoint(request: Request) -> dict[str, Any]:
@@ -116,6 +180,9 @@ async def root_endpoint(request: Request) -> dict[str, Any]:
         "health": "/health",
         "process": "POST /process/{station_id}",
         "metrics": "GET /metrics/{station_id}",
+        "llm_metrics_summary": "POST /llm/metrics-summary",
+        "llm_query": "POST /llm/query",
+        "llm_data_quality_summary": "POST /llm/data-quality-summary",
     }
 
 
@@ -202,6 +269,122 @@ async def get_metrics_endpoint(
     ]
 
 
+def _request_id(request: Request) -> str | None:
+    return getattr(request.state, "request_id", None)
+
+
+def _llm_features_or_503(request: Request) -> LLMFeatureService:
+    backend = getattr(request.app.state, "llm_backend", None)
+    if backend is None:
+        raise HTTPException(
+            status_code=503,
+            detail="LLM features disabled or not configured (set SENSOR_APP_LLM_ENABLED and API key)",
+        )
+    return LLMFeatureService(backend, get_settings(request))
+
+
+async def _resolve_snapshot(
+    store: MetricsStore,
+    body: LLMStationWindowBody,
+) -> StoredSnapshot:
+    if body.snapshot_id is not None:
+        snap = await asyncio.to_thread(
+            store.get_snapshot_by_id,
+            body.station_id,
+            body.snapshot_id,
+        )
+        if snap is None:
+            raise HTTPException(status_code=404, detail="snapshot not found for station")
+        return snap
+    snaps = await asyncio.to_thread(
+        store.list_snapshots,
+        body.station_id,
+        body.start_time,
+        body.end_time,
+        None,
+    )
+    if not snaps:
+        raise HTTPException(status_code=404, detail="no metric snapshots for station/window")
+    return snaps[0]
+
+
+async def llm_metrics_summary_endpoint(
+    request: Request,
+    body: LLMStationWindowBody,
+) -> LLMTextSummaryResponse:
+    """Plain-English operational summary from stored per-device metrics (LLM prose)."""
+    settings_dep = get_settings(request)
+    store: MetricsStore = request.app.state.store
+    snap = await _resolve_snapshot(store, body)
+    svc = _llm_features_or_503(request)
+    try:
+        text = await svc.natural_language_metrics_summary(
+            snap,
+            request_id=_request_id(request),
+        )
+    except LLMError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    return LLMTextSummaryResponse(
+        summary=text,
+        snapshot_id=snap.id,
+        model=settings_dep.llm_model,
+    )
+
+
+async def llm_data_quality_summary_endpoint(
+    request: Request,
+    body: LLMStationWindowBody,
+) -> LLMTextSummaryResponse:
+    """Plain-English data-quality summary grounded in stored ``data_quality`` JSON."""
+    settings_dep = get_settings(request)
+    store: MetricsStore = request.app.state.store
+    snap = await _resolve_snapshot(store, body)
+    svc = _llm_features_or_503(request)
+    try:
+        text = await svc.natural_language_dq_summary(
+            snap,
+            request_id=_request_id(request),
+        )
+    except LLMError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    return LLMTextSummaryResponse(
+        summary=text,
+        snapshot_id=snap.id,
+        model=settings_dep.llm_model,
+    )
+
+
+async def llm_query_endpoint(
+    request: Request,
+    body: LLMQueryBody,
+) -> LLMQueryResponse:
+    """Answer a NL question using an LLM **plan** and Python aggregation over stored metrics."""
+    settings_dep = get_settings(request)
+    if len(body.question) > settings_dep.llm_max_question_chars:
+        raise HTTPException(
+            status_code=400,
+            detail=f"question exceeds max length ({settings_dep.llm_max_question_chars})",
+        )
+    store: MetricsStore = request.app.state.store
+    snaps = await asyncio.to_thread(
+        store.list_snapshots,
+        body.station_id,
+        body.start_time,
+        body.end_time,
+        None,
+    )
+    svc = _llm_features_or_503(request)
+    try:
+        answer, facts = await svc.natural_language_query(
+            body.question,
+            snaps,
+            request_id=_request_id(request),
+        )
+    except LLMError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    return LLMQueryResponse(answer=answer, facts=facts, model=settings_dep.llm_model)
+
+
 def _mount_routes(app: FastAPI, settings: Settings) -> None:
     """Register HTTP routes with **slowapi** limits from **settings**."""
     lim = cast(Limiter, app.state.limiter)
@@ -211,9 +394,22 @@ def _mount_routes(app: FastAPI, settings: Settings) -> None:
         lim.limit(settings.rate_limit_process)(process_station_endpoint)
     )
     app.get("/metrics/{station_id}")(lim.limit(settings.rate_limit_metrics)(get_metrics_endpoint))
+    app.post("/llm/metrics-summary", response_model=LLMTextSummaryResponse)(
+        lim.limit(settings.rate_limit_llm_summary)(llm_metrics_summary_endpoint)
+    )
+    app.post("/llm/data-quality-summary", response_model=LLMTextSummaryResponse)(
+        lim.limit(settings.rate_limit_llm_dq)(llm_data_quality_summary_endpoint)
+    )
+    app.post("/llm/query", response_model=LLMQueryResponse)(
+        lim.limit(settings.rate_limit_llm_query)(llm_query_endpoint)
+    )
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    *,
+    llm_backend_override: LLMBackend | None = None,
+) -> FastAPI:
     """Build FastAPI app; inject **settings** in tests.
 
     The default module-level ``app`` uses environment-backed :class:`Settings`.
@@ -227,6 +423,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, rate_limit_exception_handler)
     app.state.settings = s
+    app.state.llm_backend_override = llm_backend_override
     _mount_routes(app, s)
     app.add_middleware(RequestIdMiddleware)
     return app

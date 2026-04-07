@@ -28,6 +28,18 @@ class Settings(BaseSettings):
         rate_limit_health: Limit for ``GET /health``.
         rate_limit_process: Limit for ``POST /process/{station_id}`` (CPU-heavy).
         rate_limit_metrics: Limit for ``GET /metrics/{station_id}``.
+        llm_enabled: When true and ``llm_api_key`` is set, LLM routes use the HTTP backend.
+        llm_api_key: Bearer token for the OpenAI-compatible chat API (never log).
+        llm_base_url: Provider base URL (e.g. ``https://api.openai.com/v1``).
+        llm_model: Chat model id passed to the provider.
+        llm_timeout_seconds: Per-request HTTP timeout for LLM calls.
+        llm_max_retries: Retries on 429 / 5xx after the first attempt.
+        llm_backoff_base_ms: Initial backoff before retries (exponential growth).
+        llm_max_question_chars: Max length for NL query text (UTF-8 code points).
+        llm_max_context_chars: Max JSON context sent to the model (truncated tail).
+        rate_limit_llm_summary: slowapi limit for ``POST /llm/metrics-summary``.
+        rate_limit_llm_query: Limit for ``POST /llm/query``.
+        rate_limit_llm_dq: Limit for ``POST /llm/data-quality-summary``.
     """
 
     model_config = SettingsConfigDict(
@@ -49,3 +61,15 @@ class Settings(BaseSettings):
     rate_limit_health: str = "120/minute"
     rate_limit_process: str = "30/minute"
     rate_limit_metrics: str = "60/minute"
+    llm_enabled: bool = False
+    llm_api_key: str = ""
+    llm_base_url: str = "https://api.openai.com/v1"
+    llm_model: str = "gpt-4o-mini"
+    llm_timeout_seconds: float = 60.0
+    llm_max_retries: int = 3
+    llm_backoff_base_ms: int = 400
+    llm_max_question_chars: int = 2000
+    llm_max_context_chars: int = 80_000
+    rate_limit_llm_summary: str = "30/minute"
+    rate_limit_llm_query: str = "30/minute"
+    rate_limit_llm_dq: str = "30/minute"
