@@ -233,6 +233,106 @@ def _any_oor_expr(numeric_cols: list[str], schema: LoadedSchema) -> pl.Expr:
     return out
 
 
+def run_pipeline_on_dataframe(
+    raw: pl.DataFrame,
+    station_id: str,
+    schema: LoadedSchema,
+    config: PipelineConfig | None = None,
+    *,
+    dq_extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate → impute → resample → metrics on readings already in memory.
+
+    Expects the same columns as :meth:`SqliteSensorRepository.load_readings`. Rows are
+    filtered to **station_id** before processing. Used by the streaming consumer
+    (``spec_ch3``) and tests; batch mode uses :func:`run_station_pipeline` which loads
+    from SQLite then calls this.
+    """
+    cfg = config or PipelineConfig()
+    if not raw.is_empty():
+        raw = raw.filter(pl.col("station_id") == station_id)
+
+    rows_before = raw.height
+    extra_base: dict[str, Any] = dict(dq_extra or {})
+    if raw.is_empty():
+        extra_base.setdefault("note", "no rows for station/window")
+        dq = DataQualityReport(
+            missing_fraction_by_column={},
+            out_of_range_count_by_column={},
+            flatline_periods_count=0,
+            rows_before_clean=0,
+            rows_after_clean=0,
+            anomaly_rows_pre_clean=0,
+            extra=extra_base,
+        )
+        metrics = compute_station_metrics(
+            raw,
+            station_id,
+            cfg.motor_on_threshold_rpm,
+            cfg.power_on_threshold_kw,
+            cfg.flow_epsilon_m3h,
+        )
+        return {
+            "station_id": station_id,
+            "window_start": "",
+            "window_end": "",
+            "data_quality": dq.to_dict(),
+            "data_quality_score": 0.0,
+            "metrics": _metrics_to_json(metrics),
+        }
+
+    raw = raw.with_columns(pl.col("timestamp").cast(pl.Datetime(time_zone="UTC")))
+
+    numeric_cols = schema.sensor_numeric_columns
+    miss_before = _missing_fractions(raw, ["timestamp", "station_id", "device_id", *numeric_cols])
+    bad_raw = _any_oor_expr(numeric_cols, schema)
+    anomaly_rows = int(raw.filter(bad_raw).height)
+
+    validated, oor_counts = _validate_ranges(raw, schema)
+    flat_pre = _count_flatline_periods(validated, schema)
+    cleaned = _apply_missing_strategy(validated, cfg.missing_strategy, numeric_cols)
+    resampled = _resample_by_device(cleaned, cfg.resample_rule, numeric_cols)
+    flat_post = _count_flatline_periods(resampled, schema)
+    miss_after = _missing_fractions(resampled, numeric_cols)
+
+    extra_base.update(
+        {
+            "missing_fraction_before_clean": miss_before,
+            "flatline_periods_pre_clean_hint": flat_pre,
+            "resample_rule": cfg.resample_rule,
+            "missing_strategy": cfg.missing_strategy.value,
+        }
+    )
+    dq = DataQualityReport(
+        missing_fraction_by_column=miss_after,
+        out_of_range_count_by_column=oor_counts,
+        flatline_periods_count=flat_post,
+        rows_before_clean=rows_before,
+        rows_after_clean=resampled.height,
+        anomaly_rows_pre_clean=anomaly_rows,
+        extra=extra_base,
+    )
+    score = _data_quality_score(miss_after, oor_counts, max(rows_before, 1))
+
+    metrics = compute_station_metrics(
+        resampled,
+        station_id,
+        cfg.motor_on_threshold_rpm,
+        cfg.power_on_threshold_kw,
+        cfg.flow_epsilon_m3h,
+    )
+    metrics.extras["data_quality_score"] = score
+
+    return {
+        "station_id": station_id,
+        "window_start": metrics.window_start,
+        "window_end": metrics.window_end,
+        "data_quality": dq.to_dict(),
+        "data_quality_score": score,
+        "metrics": _metrics_to_json(metrics),
+    }
+
+
 def run_station_pipeline(
     sensor_db_path: str,
     schema_path: str,
@@ -263,80 +363,7 @@ def run_station_pipeline(
     schema = LoadedSchema.from_path(schema_path)
     repo: SensorReadingSource = SqliteSensorRepository(sensor_db_path)
     raw = repo.load_readings(station_id, start, end)
-    rows_before = raw.height
-    # Short-circuit: still return a stable shape so the API can persist an empty snapshot.
-    if raw.is_empty():
-        dq = DataQualityReport(
-            missing_fraction_by_column={},
-            out_of_range_count_by_column={},
-            flatline_periods_count=0,
-            rows_before_clean=0,
-            rows_after_clean=0,
-            anomaly_rows_pre_clean=0,
-            extra={"note": "no rows for station/window"},
-        )
-        metrics = compute_station_metrics(
-            raw,
-            station_id,
-            cfg.motor_on_threshold_rpm,
-            cfg.power_on_threshold_kw,
-            cfg.flow_epsilon_m3h,
-        )
-        return {
-            "station_id": station_id,
-            "window_start": "",
-            "window_end": "",
-            "data_quality": dq.to_dict(),
-            "data_quality_score": 0.0,
-            "metrics": _metrics_to_json(metrics),
-        }
-
-    numeric_cols = schema.sensor_numeric_columns
-    miss_before = _missing_fractions(raw, ["timestamp", "station_id", "device_id", *numeric_cols])
-    # Pre-clean: how many rows had at least one OOR numeric (before nulling).
-    bad_raw = _any_oor_expr(numeric_cols, schema)
-    anomaly_rows = int(raw.filter(bad_raw).height)
-
-    validated, oor_counts = _validate_ranges(raw, schema)
-    flat_pre = _count_flatline_periods(validated, schema)
-    cleaned = _apply_missing_strategy(validated, cfg.missing_strategy, numeric_cols)
-    resampled = _resample_by_device(cleaned, cfg.resample_rule, numeric_cols)
-    flat_post = _count_flatline_periods(resampled, schema)
-    miss_after = _missing_fractions(resampled, numeric_cols)
-
-    dq = DataQualityReport(
-        missing_fraction_by_column=miss_after,
-        out_of_range_count_by_column=oor_counts,
-        flatline_periods_count=flat_post,
-        rows_before_clean=rows_before,
-        rows_after_clean=resampled.height,
-        anomaly_rows_pre_clean=anomaly_rows,
-        extra={
-            "missing_fraction_before_clean": miss_before,
-            "flatline_periods_pre_clean_hint": flat_pre,
-            "resample_rule": cfg.resample_rule,
-            "missing_strategy": cfg.missing_strategy.value,
-        },
-    )
-    score = _data_quality_score(miss_after, oor_counts, max(rows_before, 1))
-
-    metrics = compute_station_metrics(
-        resampled,
-        station_id,
-        cfg.motor_on_threshold_rpm,
-        cfg.power_on_threshold_kw,
-        cfg.flow_epsilon_m3h,
-    )
-    metrics.extras["data_quality_score"] = score
-
-    return {
-        "station_id": station_id,
-        "window_start": metrics.window_start,
-        "window_end": metrics.window_end,
-        "data_quality": dq.to_dict(),
-        "data_quality_score": score,
-        "metrics": _metrics_to_json(metrics),
-    }
+    return run_pipeline_on_dataframe(raw, station_id, schema, cfg)
 
 
 def _metrics_to_json(m: StationMetricsResult) -> dict[str, Any]:

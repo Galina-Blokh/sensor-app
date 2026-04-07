@@ -45,6 +45,15 @@ class Settings(BaseSettings):
         llm_fallback_base_url: Secondary base (e.g. Groq or local OpenAI-compatible URL).
         llm_fallback_api_key: Secondary bearer; if empty, **primary** ``llm_api_key`` is reused.
         llm_fallback_model: Secondary model id for that host.
+        stream_consumer_enabled: When true and an ``event_queue`` is wired into
+            :func:`sensor_app.api.main.create_app`, run the background queue reader
+            (``spec_ch3``).
+        stream_flush_min_events: Flush buffered valid readings to the pipeline after
+            this many rows (per process).
+        stream_max_seen_event_ids: Bounded de-duplication set for ``event_id``
+            (at-least-once safe).
+        rate_limit_stream_status: slowapi limit for ``GET /stream/status``.
+        rate_limit_stream_flush: slowapi limit for ``POST /stream/flush``.
     """
 
     model_config = SettingsConfigDict(
@@ -82,3 +91,8 @@ class Settings(BaseSettings):
     llm_fallback_base_url: str = ""
     llm_fallback_api_key: str = ""
     llm_fallback_model: str = ""
+    stream_consumer_enabled: bool = False
+    stream_flush_min_events: int = 2000
+    stream_max_seen_event_ids: int = 100_000
+    rate_limit_stream_status: str = "120/minute"
+    rate_limit_stream_flush: str = "30/minute"

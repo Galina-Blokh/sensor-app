@@ -2,7 +2,15 @@
 
 **Project name:** **sensor_app** (extends the same codebase as **spec_ch1.md**).
 
-Extends **spec_ch1.md** (ingestion library and metrics model) with a queue-driven consumer and related API surface.
+This file is the **product spec** for **Challenge 3 — Event-Driven Consumer** in the take-home assignment (**optional bonus**, same weighting as in the assignment). It extends **spec_ch1.md** (ingestion library and metrics model) with a queue-driven consumer and related API surface. **spec_ch2.md** (LLM) is independent: if both are in scope, the streaming consumer and `/llm/*` routes can coexist without changing the event contract.
+
+**Assignment mapping (take-home Challenge 3):**
+
+| Assignment section | Where it lives in this spec |
+|--------------------|----------------------------|
+| Part 1 — Consumer & processing | §§1, 3 (consumer, transport separation, errors) |
+| Part 2 — Query API | §4 (metrics + processing status) |
+| Part 3 — Design note (two questions) | §5 |
 
 ## 0.1 Runtime model (async)
 
@@ -18,32 +26,32 @@ Sensor data in production is **event-driven**. The solution **must** include:
 
 ## 2. Provided artifact
 
-* **`producer.py`** is **read-only** for the implementer: **do not edit** it. Read it to learn the **`SensorEvent`** shape (`event_id`, `event_type`, ISO 8601 `timestamp`, `station_id`, `device_id`, `readings` with possible `None`, optional `metadata`) and the **stream end** signal (**`None` sentinel** or producer stop), as documented in that module.
+* **`producer.py`** — **ready-to-run** producer (assignment wording): **read-only** for the implementer (**do not modify** the file). Read it to learn the event format and how events are pushed into the shared queue. The **`SensorEvent`** shape includes `event_id`, `event_type`, ISO 8601 `timestamp`, `station_id`, `device_id`, `readings` with possible `None`, optional `metadata`, and the **stream end** signal (**`None` sentinel** or producer stop), as documented in that module.
 
 ## 3. Consumer and processing
 
-The consumer **must**:
+The consumer **must** satisfy the assignment’s Part 1:
 
-* **Read** events from the **`queue.Queue`** the producer uses.
-* **Validate and process** each event through the **ingestion and validation logic from spec_ch1.md** (same rules as batch work, adapted to per-event or micro-batches as needed).
-* **Update stored aggregates** in line with the **metric model from spec_ch1.md**.
-* **Survive bad input**: malformed events and processing errors **must not** crash the whole loop; behavior (skip, dead-letter, counters, logging) **must** be **defined and documented**.
+* **Read** events from the **queue provided by the producer** (in-repo: shared **`queue.Queue`**).
+* **Validate and process** each event using the **library from Challenge 1 / spec_ch1.md** (same validation and pipeline rules as batch mode, adapted to per-event or micro-batches as needed).
+* **Compute and store aggregated metrics** consistent with the **metric model from spec_ch1.md**.
+* **Handle errors gracefully**: malformed events and processing failures **must not** crash the whole loop; behavior (skip, dead-letter, counters, logging) **must** be **defined and documented**.
 
-**Transport separation.** Queue I/O **must** sit behind an interface so only **adapters** change when moving from `queue.Queue` to **Redis Streams**, **Google Pub/Sub**, or similar. **Core processing code must not** hard-code the in-memory queue type.
+**Transport separation (assignment wording).** Swapping the in-memory queue for a production broker (**e.g. Redis Streams, Pub/Sub**) **must** only require changing the **transport / adapter** implementation, **not** the core processing logic. Queue I/O **must** sit behind an interface; **core processing code must not** hard-code the in-memory queue type.
 
 ## 4. Query API
 
-Expose HTTP (or equivalent) endpoints that **must** support:
+Expose HTTP (or equivalent) endpoints satisfying assignment **Part 2** (may **extend the API from Challenge 1 / spec_ch1.md**):
 
-* **Aggregated metrics** for a station with **optional filters**: time range, device, metric type. Exact paths are **implementation-defined** but **must** be documented.
-* **Processing status**: **events processed**, **errors**, and **current backlog depth** (for example `queue.Queue.qsize()` while using `producer.py`). If the transport later hides depth, **document** the replacement signal (for example consumer lag in seconds).
+* **Aggregated metrics** for a station with **optional filters**: **time range**, **device**, **metric type** (assignment list). Exact paths are **implementation-defined** but **must** be documented.
+* **Processing status** at minimum what the assignment calls out: **events consumed** (processed), **errors encountered**, plus counters or rates you define. **Additionally** (recommended for the in-memory demo): **current backlog depth** (e.g. `queue.Queue.qsize()` while using `producer.py`). If the transport later hides depth, **document** the replacement signal (e.g. consumer lag in seconds).
 
 ## 5. Design document (1 page max)
 
-Add or extend a design note (**at most one page**) that **answers both** questions:
+Add or extend a design note (**at most one page**) answering assignment **Part 3** — **both** questions, in line with the take-home wording:
 
-1. How **producer** and **consumer** deploy as **independently scalable** services, and how **multiple consumer instances** avoid **processing the same event twice**.
-2. What happens when the **consumer lags** the producer, how **lag is detected**, and which **strategies** shrink or bound **backlog** growth.
+1. How would you **deploy the producer and consumer as independently scalable services**? Include how **multiple consumer instances** would **coordinate to avoid processing the same event twice**.
+2. What happens when the **consumer falls behind the producer**? How would you **detect** that, and what **strategies** would you use to **handle the growing backlog**?
 
 ## 6. Documentation
 

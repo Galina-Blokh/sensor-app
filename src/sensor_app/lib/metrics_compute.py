@@ -24,8 +24,18 @@ import polars as pl
 
 
 def _series_float(df: pl.DataFrame, expr: pl.Expr) -> float:
-    """Single scalar from a one-cell Polars frame (keeps mypy happy vs ``Series`` unions)."""
-    return float(df.select(expr).item())
+    """Single scalar from a one-cell Polars frame (keeps mypy happy vs ``Series`` unions).
+
+    Polars may return ``None`` for ``std()`` (and similar) with too few points after resample;
+    treat as NaN so streaming and batch paths do not crash.
+    """
+    v = df.select(expr).item()
+    if v is None:
+        return float("nan")
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float("nan")
 
 
 @dataclass

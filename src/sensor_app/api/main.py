@@ -7,14 +7,17 @@
 and **slowapi** rate limits per route (see :class:`sensor_app.settings.Settings`).
 
 Routes: ``GET /`` (index), ``GET /health``, ``POST /process/{station_id}``,
-``GET /metrics/{station_id}``, LLM routes under ``POST /llm/*`` (OpenAI-compatible providers
-e.g. OpenAI, Groq, self-hosted; optional primary+fallback chain) plus FastAPI ``/docs``.
+``GET /metrics/{station_id}``, optional ``GET /stream/status`` and ``POST /stream/flush``
+when a queue-backed consumer is wired (``spec_ch3``), LLM routes under ``POST /llm/*``
+(OpenAI-compatible providers e.g. OpenAI, Groq, self-hosted; optional primary+fallback chain)
+plus FastAPI ``/docs``.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import queue
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -31,6 +34,8 @@ from starlette.responses import Response
 from sensor_app.api.middleware import RequestIdMiddleware, configure_app_logging
 from sensor_app.lib.metrics_store import MetricsStore, StoredSnapshot
 from sensor_app.lib.pipeline import MissingDataStrategy, PipelineConfig, run_station_pipeline
+from sensor_app.lib.schema_defs import LoadedSchema
+from sensor_app.lib.stream_consumer import StreamProcessor
 from sensor_app.llm.client import (
     LLMBackend,
     OpenAICompatibleChatBackend,
@@ -41,6 +46,9 @@ from sensor_app.llm.service import LLMFeatureService
 from sensor_app.settings import Settings
 
 logger = logging.getLogger(__name__)
+
+# Sentinel: ``queue.Queue.get`` timed out (no item yet).
+_QUEUE_EMPTY = object()
 
 # Shared limiter instance; per-route strings come from :class:`Settings` at mount time.
 limiter = Limiter(key_func=get_remote_address)
@@ -133,48 +141,153 @@ def pipeline_config_from_settings(settings: Settings) -> PipelineConfig:
     )
 
 
+def _filter_snapshots_metric_key(
+    rows: list[dict[str, Any]],
+    metric_key: str,
+) -> list[dict[str, Any]]:
+    """Keep only **metric_key** in each device's ``metrics`` map (``spec_ch3`` filter)."""
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        m = dict(row.get("metrics") or {})
+        devs = m.get("devices")
+        if not isinstance(devs, list):
+            out.append(row)
+            continue
+        new_devs: list[dict[str, Any]] = []
+        for d in devs:
+            if not isinstance(d, dict):
+                new_devs.append(d)
+                continue
+            vals = d.get("metrics")
+            if not isinstance(vals, dict):
+                new_devs.append(d)
+                continue
+            v = vals.get(metric_key)
+            new_devs.append(
+                {
+                    **d,
+                    "metrics": {metric_key: v} if v is not None else {},
+                }
+            )
+        out.append({**row, "metrics": {**m, "devices": new_devs}})
+    return out
+
+
+def _wire_llm_backend(app: FastAPI, settings: Settings) -> bool:
+    """Attach OpenAI-compatible client(s) to ``app.state``. Returns whether fallback is wired."""
+    app.state.llm_http_client = None
+    app.state.llm_backend = None
+    override = cast(LLMBackend | None, getattr(app.state, "llm_backend_override", None))
+    if override is not None:
+        app.state.llm_backend = override
+        return False
+    if not settings.llm_enabled or not settings.llm_api_key.strip():
+        return False
+    timeout = httpx.Timeout(settings.llm_timeout_seconds)
+    client = httpx.AsyncClient(timeout=timeout)
+    app.state.llm_http_client = client
+    primary = OpenAICompatibleChatBackend(
+        client=client,
+        base_url=settings.llm_base_url,
+        api_key=settings.llm_api_key,
+        model=settings.llm_model,
+        max_retries=settings.llm_max_retries,
+        backoff_base_ms=settings.llm_backoff_base_ms,
+    )
+    fb_url = settings.llm_fallback_base_url.strip()
+    fb_model = settings.llm_fallback_model.strip()
+    use_fb = settings.llm_fallback_enabled and bool(fb_url) and bool(fb_model)
+    if use_fb:
+        fb_key = settings.llm_fallback_api_key.strip() or settings.llm_api_key
+        secondary = OpenAICompatibleChatBackend(
+            client=client,
+            base_url=fb_url,
+            api_key=fb_key,
+            model=fb_model,
+            max_retries=settings.llm_max_retries,
+            backoff_base_ms=settings.llm_backoff_base_ms,
+        )
+        app.state.llm_backend = PrimaryWithFallbackBackend(primary, secondary)
+        return True
+    app.state.llm_backend = primary
+    return False
+
+
+def _start_stream_consumer_task(
+    app: FastAPI,
+    settings: Settings,
+    store: MetricsStore,
+    eq: queue.Queue[Any],
+) -> None:
+    stream_schema = LoadedSchema.from_path(settings.schema_path)
+    app.state.stream_processor = StreamProcessor(
+        store=store,
+        schema=stream_schema,
+        pipeline_config=pipeline_config_from_settings(settings),
+        flush_min_events=settings.stream_flush_min_events,
+        max_seen_event_ids=settings.stream_max_seen_event_ids,
+    )
+    stop = asyncio.Event()
+
+    async def _queue_loop() -> None:
+        processor = app.state.stream_processor
+        assert isinstance(processor, StreamProcessor)
+        processor.set_running(True)
+        try:
+            while not stop.is_set():
+
+                def _pull() -> Any:
+                    try:
+                        return eq.get(timeout=0.5)
+                    except queue.Empty:
+                        return _QUEUE_EMPTY
+
+                item = await asyncio.to_thread(_pull)
+                if item is _QUEUE_EMPTY:
+                    continue
+                await asyncio.to_thread(processor.handle, item)
+        finally:
+            processor.set_running(False)
+
+    app.state._stream_stop = stop
+    app.state._stream_task = asyncio.create_task(_queue_loop())
+
+
+async def _shutdown_stream_consumer(app: FastAPI) -> None:
+    st = getattr(app.state, "_stream_stop", None)
+    task = getattr(app.state, "_stream_task", None)
+    if st is not None:
+        st.set()
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Ensure ``metric_snapshots`` exists; optionally wire OpenAI-compatible LLM client."""
+    """Ensure ``metric_snapshots`` exists; optionally wire LLM client and stream consumer."""
     settings: Settings = app.state.settings
     store = MetricsStore(settings.metrics_db_path)
     store.init()
     app.state.store = store
-    app.state.llm_http_client = None
-    app.state.llm_backend = None
-    llm_fallback_configured = False
-    override = cast(LLMBackend | None, getattr(app.state, "llm_backend_override", None))
-    if override is not None:
-        app.state.llm_backend = override
-    elif settings.llm_enabled and settings.llm_api_key.strip():
-        timeout = httpx.Timeout(settings.llm_timeout_seconds)
-        client = httpx.AsyncClient(timeout=timeout)
-        app.state.llm_http_client = client
-        primary = OpenAICompatibleChatBackend(
-            client=client,
-            base_url=settings.llm_base_url,
-            api_key=settings.llm_api_key,
-            model=settings.llm_model,
-            max_retries=settings.llm_max_retries,
-            backoff_base_ms=settings.llm_backoff_base_ms,
+    app.state.stream_processor = None
+    app.state._stream_task = None
+    app.state._stream_stop = None
+
+    llm_fallback_configured = _wire_llm_backend(app, settings)
+
+    eq = cast(queue.Queue[Any] | None, getattr(app.state, "event_queue", None))
+    if settings.stream_consumer_enabled and eq is not None:
+        _start_stream_consumer_task(app, settings, store, eq)
+    elif settings.stream_consumer_enabled and eq is None:
+        logger.warning(
+            "stream_consumer_enabled but app.state.event_queue is missing; "
+            "pass event_queue= to create_app() or use run_streaming_stack.py"
         )
-        fb_url = settings.llm_fallback_base_url.strip()
-        fb_model = settings.llm_fallback_model.strip()
-        use_fb = settings.llm_fallback_enabled and bool(fb_url) and bool(fb_model)
-        if use_fb:
-            fb_key = settings.llm_fallback_api_key.strip() or settings.llm_api_key
-            secondary = OpenAICompatibleChatBackend(
-                client=client,
-                base_url=fb_url,
-                api_key=fb_key,
-                model=fb_model,
-                max_retries=settings.llm_max_retries,
-                backoff_base_ms=settings.llm_backoff_base_ms,
-            )
-            app.state.llm_backend = PrimaryWithFallbackBackend(primary, secondary)
-            llm_fallback_configured = True
-        else:
-            app.state.llm_backend = primary
+
     logger.info(
         "sensor_app started",
         extra={
@@ -182,11 +295,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             "metrics_db": settings.metrics_db_path,
             "llm": "on" if app.state.llm_backend is not None else "off",
             "llm_fallback": llm_fallback_configured,
+            "stream_consumer": app.state.stream_processor is not None,
         },
     )
     try:
         yield
     finally:
+        await _shutdown_stream_consumer(app)
         hc = getattr(app.state, "llm_http_client", None)
         if hc is not None:
             await hc.aclose()
@@ -207,6 +322,8 @@ async def root_endpoint(request: Request) -> dict[str, Any]:
         "llm_metrics_summary": "POST /llm/metrics-summary",
         "llm_query": "POST /llm/query",
         "llm_data_quality_summary": "POST /llm/data-quality-summary",
+        "stream_status": "GET /stream/status",
+        "stream_flush": "POST /stream/flush",
     }
 
 
@@ -269,8 +386,12 @@ async def get_metrics_endpoint(
     start_time: Annotated[str | None, Query()] = None,
     end_time: Annotated[str | None, Query()] = None,
     device_id: Annotated[str | None, Query()] = None,
+    metric_key: Annotated[
+        str | None,
+        Query(description="If set, keep only this key in each device's metrics map"),
+    ] = None,
 ) -> list[dict[str, Any]]:
-    """List saved snapshots for **station_id**, newest first; optional window/device filter."""
+    """List saved snapshots for **station_id**, newest first; optional window/device/metric filter."""
     store: MetricsStore = request.app.state.store
     snaps = await asyncio.to_thread(
         store.list_snapshots,
@@ -279,7 +400,7 @@ async def get_metrics_endpoint(
         end_time,
         device_id,
     )
-    return [
+    rows = [
         {
             "id": s.id,
             "station_id": s.station_id,
@@ -291,6 +412,33 @@ async def get_metrics_endpoint(
         }
         for s in snaps
     ]
+    if metric_key and metric_key.strip():
+        rows = _filter_snapshots_metric_key(rows, metric_key.strip())
+    return rows
+
+
+async def stream_status_endpoint(request: Request) -> dict[str, Any]:
+    """Processing status + backlog depth when a stream consumer is active (``spec_ch3``)."""
+    proc = getattr(request.app.state, "stream_processor", None)
+    eq = getattr(request.app.state, "event_queue", None)
+    if proc is None:
+        return {
+            "enabled": False,
+            "detail": "Stream consumer not running (set SENSOR_APP_STREAM_CONSUMER_ENABLED=true "
+            "and pass event_queue to create_app(), or run run_streaming_stack.py).",
+        }
+    backlog = eq.qsize() if isinstance(eq, queue.Queue) else None
+    snap = proc.status_snapshot(backlog)
+    return {"enabled": True, **snap}
+
+
+async def stream_flush_endpoint(request: Request) -> dict[str, Any]:
+    """Drain the in-memory buffer into metric snapshots (does not drain the broker queue)."""
+    proc = getattr(request.app.state, "stream_processor", None)
+    if proc is None:
+        raise HTTPException(status_code=503, detail="stream consumer not configured")
+    await asyncio.to_thread(proc.flush)
+    return {"ok": True, "detail": "buffer flushed to metric_snapshots"}
 
 
 def _request_id(request: Request) -> str | None:
@@ -416,6 +564,8 @@ def _mount_routes(app: FastAPI, settings: Settings) -> None:
         lim.limit(settings.rate_limit_process)(process_station_endpoint)
     )
     app.get("/metrics/{station_id}")(lim.limit(settings.rate_limit_metrics)(get_metrics_endpoint))
+    app.get("/stream/status")(lim.limit(settings.rate_limit_stream_status)(stream_status_endpoint))
+    app.post("/stream/flush")(lim.limit(settings.rate_limit_stream_flush)(stream_flush_endpoint))
     app.post("/llm/metrics-summary", response_model=LLMTextSummaryResponse)(
         lim.limit(settings.rate_limit_llm_summary)(llm_metrics_summary_endpoint)
     )
@@ -431,6 +581,7 @@ def create_app(
     settings: Settings | None = None,
     *,
     llm_backend_override: LLMBackend | None = None,
+    event_queue: queue.Queue[Any] | None = None,
 ) -> FastAPI:
     """Build FastAPI app; inject **settings** in tests.
 
@@ -446,6 +597,7 @@ def create_app(
     app.add_exception_handler(RateLimitExceeded, rate_limit_exception_handler)
     app.state.settings = s
     app.state.llm_backend_override = llm_backend_override
+    app.state.event_queue = event_queue
     _mount_routes(app, s)
     app.add_middleware(RequestIdMiddleware)
     return app
