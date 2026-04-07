@@ -1,0 +1,2 @@
+# Consistent LF in the repo (avoids `git diff --check` treating CR as trailing whitespace).
+* text=auto eol=lf

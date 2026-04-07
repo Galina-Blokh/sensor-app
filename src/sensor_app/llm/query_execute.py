@@ -59,7 +59,10 @@ def collect_numeric_series(
             did = d.get("device_id")
             if device_id is not None and str(did) != device_id:
                 continue
-            vals = d.get("values")
+            # Pipeline persists device scalars as ``metrics`` (see ``_metrics_to_json``).
+            vals = d.get("metrics")
+            if not isinstance(vals, dict):
+                vals = d.get("values")
             if not isinstance(vals, dict):
                 continue
             v = _float_vals(vals.get(metric_key))

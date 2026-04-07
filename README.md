@@ -2,7 +2,7 @@
 
 Industrial compressed-air **sensor ingestion** (`sensor_app.lib`) and a **metrics HTTP API** (`sensor_app.api`) built with **FastAPI**. Ingestion and metrics use **Polars** (and **NumPy** for flatline run scans in the pipeline); CPU-heavy work runs in a **thread pool** via `asyncio.to_thread` so the event loop stays responsive.
 
-See **spec_ch1.md** for the full product spec; **spec_ch2.md** for the LLM integration; **design_doc.md** for monorepo distribution, schema evolution, CI/CD, and production deferrals.
+See **spec_ch1.md** for the core pipeline and metrics API; **spec_ch2.md** for LLM routes; **spec_ch3.md** for the queue-backed streaming consumer; **design_doc.md** for distribution, CI/CD, and operational notes.
 
 ## Project structure
 
@@ -14,7 +14,9 @@ See **spec_ch1.md** for the full product spec; **spec_ch2.md** for the LLM integ
 │   │   ├── metrics_compute.py  # per-device operational metrics (Polars)
 │   │   ├── metrics_store.py    # SQLite persistence for snapshots
 │   │   ├── repository.py       # readings source (SQLite impl + protocol)
-│   │   └── schema_defs.py      # sensor_schema.json loader
+│   │   ├── schema_defs.py      # sensor_schema.json loader
+│   │   ├── sensor_event.py     # producer-shaped dict → pipeline row (spec_ch3)
+│   │   └── stream_consumer.py  # buffer, dedupe, flush → same pipeline as batch (spec_ch3)
 │   ├── api/
 │   │   ├── main.py             # FastAPI app, routes, slowapi limits
 │   │   └── middleware.py       # X-Request-ID + logging filter
@@ -23,11 +25,17 @@ See **spec_ch1.md** for the full product spec; **spec_ch2.md** for the LLM integ
 ├── tests/                      # unit + integration (see Tests)
 ├── .github/workflows/ci.yml    # GitHub Actions
 ├── pyproject.toml / uv.lock
-├── .env.example               # LLM/provider template (copy to .env; .env is gitignored)
+├── .env.example               # env template (LLM + optional stream; copy to .env)
+├── docs/
+│   └── api/
+│       └── README.md           # per-route API guide (add demo videos per path)
 ├── Makefile
-├── design_doc.md               # “take-home” design answers + production notes
-├── spec_ch1.md                 # internal product spec for Challenge 1
-├── spec_ch2.md                 # LLM endpoints + ops (Challenge 2)
+├── producer.py                 # demo event producer → queue (read-only for consumers)
+├── run_streaming_stack.py      # producer + API with stream consumer wired (spec_ch3)
+├── design_doc.md               # design answers + production notes
+├── spec_ch1.md                 # core pipeline + metrics API spec
+├── spec_ch2.md                 # LLM integration spec
+├── spec_ch3.md                 # streaming consumer spec
 └── sensor_schema.json          # committed; sensor_data.db is local only (see below)
 ```
 
@@ -36,8 +44,9 @@ See **spec_ch1.md** for the full product spec; **spec_ch2.md** for the LLM integ
 1. **Library (`sensor_app.lib`)** — Single entrypoint `run_station_pipeline(...)`: reads via `SensorReadingSource`, validates against `LoadedSchema`, applies missing-data strategy, resamples, emits a **data-quality** report, computes **metrics** in Polars. No HTTP imports; callers can be batch jobs or the API.
 2. **API (`sensor_app.api`)** — Thin FastAPI layer: **`async def`** handlers call **`asyncio.to_thread`** for the pipeline and for SQLite metric writes so the event loop is not blocked. **slowapi** enforces per-route limits; **RequestIdMiddleware** adds **`X-Request-ID`** and log correlation.
 3. **Persistence** — Raw readings: **`sensor_data.db`**. Computed snapshots: **`metrics.db`** table **`metric_snapshots`** (upsert by station + window for idempotency).
-4. **LLM layer (`sensor_app.llm`)** — **OpenAI-compatible** chat API (`POST …/chat/completions`) via **`httpx.AsyncClient`**, **`LLMBackend`** protocol, **`LLMFeatureService`**; optional **`PrimaryWithFallbackBackend`** (cloud + local or two hosts). **`POST /llm/*`** uses **`MetricsStore`** only; NL **query** uses a validated JSON plan plus **Python** aggregation (see **spec_ch2.md** and **LLM endpoints** below).
-5. **Broader “system” and ops** — Versioning, schema evolution, full CD, auth, tracing, and SLOs are described in **design_doc.md** and the README **Scope & next steps** section.
+4. **LLM layer (`sensor_app.llm`)** — **OpenAI-compatible** chat API (`POST …/chat/completions`) via **`httpx.AsyncClient`**, **`LLMBackend`** protocol, **`LLMFeatureService`**; optional **`PrimaryWithFallbackBackend`**. **`POST /llm/*`** uses **`MetricsStore`** only; NL **query** uses a validated JSON plan plus **Python** aggregation (see **spec_ch2.md** and **LLM endpoints** below).
+5. **Streaming consumer (`spec_ch3`)** — Optional asyncio task reads a **`queue.Queue`**, **`StreamProcessor`** buffers and dedupes by **`event_id`**, flushes through **`run_pipeline_on_dataframe`** into the same **`metric_snapshots`** table as **`POST /process`**. Wire with **`create_app(..., event_queue=...)`** and **`SENSOR_APP_STREAM_CONSUMER_ENABLED=true`**, or run **`run_streaming_stack.py`**.
+6. **Broader “system” and ops** — Versioning, schema evolution, full CD, auth, tracing, and SLOs are described in **design_doc.md** and the README **Scope & next steps** section.
 
 ## Prerequisites
 
@@ -54,7 +63,7 @@ source .venv/bin/activate   # Linux / macOS / Git Bash
 
 ### Readings database (`sensor_data.db`)
 
-The assignment ships **`sensor_data.db`** (~111 MB). **GitHub rejects files over 100 MB**, so this file is **not committed**. Copy it from your **take-home bundle** into the repository root (next to `sensor_schema.json`) before running integration tests or the API against real data. **`sensor_schema.json`** is in the repo. CI runs **unit tests** and **skips** integration when the DB is missing.
+**`sensor_data.db`** (~111 MB) is **not committed** (GitHub blob limit). Place it in the repository root next to **`sensor_schema.json`** when you want integration tests or **`producer.py`** / **`POST /process`** against real readings. **`sensor_schema.json`** is in the repo. CI runs **unit tests** and **skips** integration when the DB is missing.
 
 ## Run checks (local)
 
@@ -74,23 +83,25 @@ make run
 # alternate port: make run PORT=8001
 ```
 
-- Index: `GET /` — short JSON map of routes (optional convenience).
-- OpenAPI: `http://127.0.0.1:8000/docs`
-- Health: `GET /health`
-- Process station: `POST /process/{station_id}?start_time=&end_time=` (ISO-8601, optional)
-- Read snapshots: `GET /metrics/{station_id}?start_time=&end_time=&device_id=`
+**Per-route guide (add your demo videos there):** **[docs/api/README.md](docs/api/README.md)** — core routes, LLM routes, stream routes, examples, **Video** placeholders. **OpenAPI / try-it-out:** `http://127.0.0.1:8000/docs`.
 
-### LLM endpoints (spec_ch2)
+### Streaming stack (spec_ch3)
 
-NL features use a **dedicated** `sensor_app.llm` layer (`httpx.AsyncClient` + OpenAI-compatible **`POST .../chat/completions`**). Handlers load metrics only via **`MetricsStore`** (parameterized SQL); the NL **query** path has the model emit a **JSON plan** (allowlisted metric keys and aggregations), then **numbers are computed in Python** from stored snapshot JSON—no SQL built from user or model text.
+Run the demo **producer** and **FastAPI** with the in-process consumer on one **`queue.Queue`**:
 
-| Route | Purpose |
-|-------|---------|
-| `POST /llm/metrics-summary` | Plain-English **operational** summary from stored per-device metrics |
-| `POST /llm/data-quality-summary` | Plain-English summary from stored **`data_quality`** (pipeline output) |
-| `POST /llm/query` | NL question → model **plan** → validated aggregation over stored metrics |
+```bash
+uv run python run_streaming_stack.py
+```
 
-Bodies (JSON): **`metrics-summary`** and **`data-quality-summary`** accept `station_id`, optional `snapshot_id`, optional `start_time` / `end_time` (same semantics as `GET /metrics` for picking the newest row in a window). **`query`** accepts `station_id`, `question`, optional `start_time` / `end_time`.
+Optional: **`PORT`**, **`HOST`**, **`STREAM_SPEED_MULTIPLIER`** (env). The app uses **`Settings(stream_consumer_enabled=True)`** and **`create_app(settings, event_queue=q)`**.
+
+**Configuration:** set **`SENSOR_APP_STREAM_CONSUMER_ENABLED=true`** and pass **`event_queue`** when embedding the app elsewhere. Tune **`SENSOR_APP_STREAM_FLUSH_MIN_EVENTS`**, **`SENSOR_APP_STREAM_MAX_SEEN_EVENT_IDS`**, and stream rate limits (table below).
+
+**Failure behavior:** malformed events increment **`events_malformed`** (see **`GET /stream/status`**) and are skipped; pipeline/flush errors set **`last_error`** on the processor and are logged; the loop keeps running. **`POST /stream/flush`** drains the buffer to **`metric_snapshots`** without draining the broker queue.
+
+### LLM layer (spec_ch2)
+
+NL features use **`sensor_app.llm`** (`httpx.AsyncClient`, OpenAI-compatible **`POST …/chat/completions`**). **`MetricsStore`** only via parameterized SQL; **`/llm/query`** uses a validated JSON plan and **Python** aggregation (see **docs/api/README.md** and **spec_ch2.md**).
 
 **When the LLM is off or misconfigured:** routes return **503** with a short detail (set env vars below). **Provider failures** (timeout, HTTP errors, bad response shape) return **502**.
 
@@ -151,10 +162,15 @@ Per-client limits use **slowapi** (in-memory; production would use Redis or a ga
 | `SENSOR_APP_LLM_FALLBACK_BASE_URL` | Secondary base (another vendor or self-hosted `…/v1`) | *(empty)* |
 | `SENSOR_APP_LLM_FALLBACK_API_KEY` | Secondary bearer; empty → reuse primary key | *(empty)* |
 | `SENSOR_APP_LLM_FALLBACK_MODEL` | Secondary model id for that host | *(empty)* |
+| `SENSOR_APP_STREAM_CONSUMER_ENABLED` | Start queue reader + **`StreamProcessor`** when **`event_queue`** is set | `false` |
+| `SENSOR_APP_STREAM_FLUSH_MIN_EVENTS` | Auto-flush buffer after this many valid rows | `2000` |
+| `SENSOR_APP_STREAM_MAX_SEEN_EVENT_IDS` | Bounded **`event_id`** dedupe set | `100000` |
+| `SENSOR_APP_RATE_LIMIT_STREAM_STATUS` | Limit for **`GET /stream/status`** | `120/minute` |
+| `SENSOR_APP_RATE_LIMIT_STREAM_FLUSH` | Limit for **`POST /stream/flush`** | `30/minute` |
 
 ## Repository artifacts
 
-- **`sensor_data.db`** — readings (`discharge_pressure`, …) and `station_metadata` (**obtain locally** from the assignment; **gitignored**).
+- **`sensor_data.db`** — readings and metadata (**gitignored**; obtain separately if you need the full dataset).
 - **`sensor_schema.json`** — validation ranges and flatline thresholds (**in repo**).
 
 ## Metric definitions
@@ -181,6 +197,7 @@ Snapshots are stored in **`metric_snapshots`** (see `sensor_app.lib.metrics_stor
 - **Unit** (no real DB): `tests/test_schema_defs.py`, `tests/test_metrics_compute.py`
 - **LLM wiring** (no API key; **mocked** backend + HTTP/retry/fallback units): `tests/test_llm.py`, `tests/test_llm_units.py`
 - **Integration** (requires `sensor_data.db`): `tests/test_pipeline_integration.py`, `tests/test_api.py`
+- **Streaming** (no live broker): `tests/test_stream_consumer.py`, `tests/test_stream_api.py`
 
 There is **no separate “LLM credentials” suite** to skip: `tests/test_llm.py` does not call a real provider. Enable `SENSOR_APP_LLM_*` only when exercising `/llm/*` manually against a live API.
 
@@ -192,5 +209,5 @@ uv run pytest                                                           # all
 
 ## Scope & next steps
 
-- **In scope (this repo):** spec_ch1 — Polars pipeline library, FastAPI metrics API, SQLite metrics store, `X-Request-ID` + structured log fields, per-route rate limits, tests, design note, GitHub Actions CI. **spec_ch2** — LLM routes, `sensor_app.llm` OpenAI-compatible client (timeouts/retries; **primary→fallback** when fallback URL+model are set, default-on), structured NL query execution, mocked tests. **`.env.example`** — copy to `.env`; LLM primary + fallback vars (never commit real `.env`).
+- **In scope (this repo):** **spec_ch1** — Polars pipeline, FastAPI metrics API, SQLite store, request IDs, rate limits, CI. **spec_ch2** — LLM routes, OpenAI-compatible client, fallback chain, mocked tests. **spec_ch3** — queue consumer, shared **`run_pipeline_on_dataframe`**, **`GET /stream/status`**, **`POST /stream/flush`**, **`metric_key`** on **`GET /metrics`**, **`run_streaming_stack.py`**. **`.env.example`** — copy to `.env` (never commit secrets).
 - **Deferred / production (see design_doc.md):** OAuth2/JWT or mTLS on `/process` and `/metrics`; Redis-backed rate limits; Prometheus/OpenTelemetry (latency, error rate, pipeline duration); centralized JSON logging; HA Postgres/BigQuery instead of SQLite; multi-region DR and formal SLOs.

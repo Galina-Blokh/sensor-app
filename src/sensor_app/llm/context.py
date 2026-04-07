@@ -15,14 +15,20 @@ def _truncate(s: str, max_chars: int) -> str:
 
 
 def snapshot_metrics_context(snap: StoredSnapshot) -> dict[str, Any]:
-    """Structured view of one row: station, window, devices[].values only."""
+    """Structured view of one row: station, window, devices[].values only.
+
+    Persisted snapshots use ``devices[].metrics`` (see pipeline); we normalize to
+    ``values`` in this payload so prompts stay stable.
+    """
     devices = snap.metrics.get("devices", [])
     slim = []
     for d in devices:
         if not isinstance(d, dict):
             continue
         did = d.get("device_id")
-        vals = d.get("values")
+        vals = d.get("metrics")
+        if not isinstance(vals, dict):
+            vals = d.get("values")
         if isinstance(vals, dict):
             slim.append({"device_id": did, "values": vals})
     return {
@@ -56,5 +62,18 @@ def dumps_bounded(obj: Any, max_chars: int) -> str:
 
 
 def multi_snapshot_query_context(snaps: list[StoredSnapshot]) -> list[dict[str, Any]]:
-    """One entry per snapshot, newest-first order preserved."""
-    return [snapshot_metrics_context(s) for s in snaps]
+    """One entry per snapshot, newest-first order preserved.
+
+    Includes ``data_quality`` so NL queries about missing/out-of-range data can be
+    grounded; aggregation still runs only on allowlisted ``metric_key`` values.
+    """
+    out: list[dict[str, Any]] = []
+    for s in snaps:
+        row = snapshot_metrics_context(s)
+        row["data_quality"] = s.data_quality
+        extras = s.metrics.get("extras")
+        row["data_quality_score"] = (
+            extras.get("data_quality_score") if isinstance(extras, dict) else None
+        )
+        out.append(row)
+    return out

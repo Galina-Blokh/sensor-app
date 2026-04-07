@@ -36,6 +36,8 @@ htmlcov/
 # .python-version
 
 # OS / editors
+# Ignore Windows reserved device name from accidental `> nul` redirects
+nul
 .DS_Store
 Thumbs.db
 *.swp

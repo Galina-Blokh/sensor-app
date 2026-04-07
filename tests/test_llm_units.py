@@ -18,7 +18,11 @@ from sensor_app.llm.client import (
     extract_json_object,
     should_try_fallback,
 )
-from sensor_app.llm.context import dumps_bounded, snapshot_metrics_context
+from sensor_app.llm.context import (
+    dumps_bounded,
+    multi_snapshot_query_context,
+    snapshot_metrics_context,
+)
 from sensor_app.llm.exceptions import LLMError, LLMTimeoutError, LLMUpstreamError
 from sensor_app.llm.query_execute import (
     aggregate_values,
@@ -175,6 +179,24 @@ def test_snapshot_metrics_context_skips_non_dict_device() -> None:
     s = _snap(metrics={"devices": [{"device_id": 1, "values": {7: 8}}, "x"]})
     ctx = snapshot_metrics_context(s)
     assert ctx["devices"] == [{"device_id": 1, "values": {7: 8}}]
+
+
+def test_snapshot_metrics_context_reads_persisted_metrics_key() -> None:
+    s = _snap(metrics={"devices": [{"device_id": "D1", "metrics": {"reading_count": 9}}]})
+    ctx = snapshot_metrics_context(s)
+    assert ctx["devices"] == [{"device_id": "D1", "values": {"reading_count": 9}}]
+
+
+def test_multi_snapshot_query_context_includes_data_quality() -> None:
+    dq = {"out_of_range_count_by_column": {"discharge_pressure": 3}}
+    s = _snap(
+        dq=dq,
+        metrics={"devices": [], "extras": {"data_quality_score": 0.91}},
+    )
+    rows = multi_snapshot_query_context([s])
+    assert len(rows) == 1
+    assert rows[0]["data_quality"] == dq
+    assert rows[0]["data_quality_score"] == 0.91
 
 
 def test_extract_json_object_fenced_and_errors() -> None:

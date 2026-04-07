@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run ``producer.SensorEventProducer`` and the FastAPI stream consumer together (``spec_ch3``).
+"""Run ``producer.SensorEventProducer`` and FastAPI with the in-process queue consumer.
 
 From the repository root (next to ``producer.py``)::
 

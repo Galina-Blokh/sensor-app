@@ -45,3 +45,13 @@ This submission uses **SQLite** and **thread-offloaded Polars/NumPy** for clarit
 **Failure modes:** LLM disabled or missing key → **503**; provider/parse failures → **502**. **Fallback:** `SENSOR_APP_LLM_FALLBACK_*` wires a second base URL + model (e.g. **Groq** after **OpenAI**); it is **on by default** when URL+model are set—primary is always tried first, then one secondary call after transient primary failure (see README). **Cost / abuse:** input length caps, per-route rate limits, no full prompt logging (see README).
 
 **Tests:** `tests/test_llm.py` and `tests/test_llm_units.py` mock backends and exercise retries/fallback logic (no live API in CI). **Configuration:** README + **`.env.example`** (`SENSOR_APP_LLM_*`).
+
+## 8. spec_ch3 — Event-driven consumer (deployment and backlog)
+
+**Independent scaling.** Run **producer** and **consumer** as separate deployable units (e.g. two Kubernetes Deployments or ECS services). The producer only needs connectivity to the **message bus** and its data source; the consumer only needs the bus, **metrics** storage, and **schema** path. Scale each on **CPU**, **egress**, or **lag** independently.
+
+**Multiple consumers without double-processing.** Use **partitioned topics** (Kafka partitions, Redis Streams consumer groups, Pub/Sub with **ordering keys** + one active lease per key, etc.) so each message is delivered to **one** consumer in a group. Combine with **idempotent sinks**: this repo dedupes by **`event_id`** in **`StreamProcessor`** before flush; production would add **broker acks** after successful persist and possibly **outbox / exactly-once** semantics where the warehouse requires it.
+
+**Consumer behind producer — detection.** Emit **queue depth**, **oldest-unacked age**, **consume rate vs publish rate**, and **processing latency** (histogram). Alert when depth or age crosses SLO (e.g. p95 lag > N minutes).
+
+**Backlog strategies.** **Scale out** consumers within the same group (more partitions → more parallelism). **Throttle** the producer when downstream is unhealthy. **Prioritize** stations or drop **non-critical** streams under stress. **Pause and replay** from durable log after fixing the consumer. For SQLite demos, **single-writer** limits throughput; production uses **higher-write** stores or **sharded** metrics tables.
