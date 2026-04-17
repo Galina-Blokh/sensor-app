@@ -50,7 +50,7 @@ source .venv/bin/activate   # Linux / macOS / Git Bash
 
 ### Readings database (`sensor_data.db`)
 
-The assignment ships **`sensor_data.db`** (~111 MB). **GitHub rejects files over 100 MB**, so this file is **not committed**. Copy it from your **take-home bundle** into the repository root (next to `sensor_schema.json`) before running integration tests or the API against real data. **`sensor_schema.json`** is in the repo. CI runs **unit tests** and **skips** integration when the DB is missing.
+The repo ships **`sensor_data.db`** (~111 MB). **GitHub rejects files over 100 MB**, so this file is **not committed**. Copy it from your **bundle** into the repository root (next to `sensor_schema.json`) before running integration tests or the API against real data. **`sensor_schema.json`** is in the repo. CI runs **unit tests** and **skips** integration when the DB is missing.
 
 ## Run checks (local)
 
